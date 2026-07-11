@@ -1551,10 +1551,10 @@ def print_help():
         print(f"  {cmd_col}  {dim(desc)}")
     heading("EXAMPLES")
     examples = (
-        "sspinner register lawial",
-        "sspinner run lawial",
-        "sspinner run lawial -b   # background: no window, no attach",
-        "sspinner stop lawial",
+        "sspinner register myapp",
+        "sspinner run myapp",
+        "sspinner run myapp -b   # background: no window, no attach",
+        "sspinner stop myapp",
         "sspinner list",
     )
     for line in examples:

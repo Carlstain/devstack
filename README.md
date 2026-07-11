@@ -6,7 +6,7 @@ Global launcher for multi-repo local dev stacks. You register a project once
 whole thing from anywhere with one command:
 
 ```bash
-sspinner run lawial
+sspinner run myapp
 ```
 
 Each service gets its own split pane (its actual live output — docker compose
@@ -16,6 +16,8 @@ port. Panes open in [Terminator](https://gnome-terminator.org/) if it's
 installed, falling back to tmux, falling back to a plain sequential mode with
 no panes at all. A shared Dozzle container gives a web-based view of every
 project's docker logs regardless of which one is currently running.
+
+<p align="center"><img src="images/sspinner-help.png" width="640" alt="sspinner --help output"></p>
 
 ## Install
 
@@ -52,6 +54,12 @@ sspinner infra up / down      # manage the shared Dozzle log viewer directly
 ```
 
 (`sspinner down <project>` still works as a deprecated alias for `stop`.)
+
+`sspinner list` shows every registered project with a live status table —
+green `● running` when a service's port answers (or its docker-compose
+project has containers up), dim `○ stopped`/`○ unknown` otherwise:
+
+<p align="center"><img src="images/sspinner-list.png" width="640" alt="sspinner list output showing two demo projects with live status"></p>
 
 ### `run -b` boots without taking over your terminal
 
