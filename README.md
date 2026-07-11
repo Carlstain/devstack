@@ -46,9 +46,25 @@ devstack register <project>   # interactive: add services one at a time
 devstack edit <project>       # open the raw config in $EDITOR
 devstack list                 # show every registered project + live up/down status
 devstack run <project>        # boot it: one pane per service, in order
-devstack down <project>       # tear down its docker-compose services, close the panes
+devstack run <project> -b     # boot it in the background: no window, no attach
+devstack stop <project>       # tear down its docker-compose services, close the panes
 devstack infra up / down      # manage the shared Dozzle log viewer directly
 ```
+
+(`devstack down <project>` still works as a deprecated alias for `stop`.)
+
+### `run -b` boots without taking over your terminal
+
+`-b`/`--background` skips Terminator entirely (no GUI window) and boots the
+stack in a detached tmux session instead — same live status table while it
+boots, but at the end you're returned straight to your shell with an
+`attach with: tmux attach -t devstack-<project>` pointer instead of being
+attached. `devstack stop` tears the whole thing down, background or not —
+updating the same kind of in-place live status table on the way down.
+Without tmux installed, `-b` falls back to running every service in the
+background with output logged to temp files — but devstack keeps no pid
+file, so `stop` can only tear down the docker-compose services of a
+tmux-less background run; install tmux for reliable background teardown.
 
 ### `register` walks you through each service
 
@@ -64,6 +80,11 @@ For every service it asks:
   free text. Best-effort port detection pre-fills the port question too.
 - **port** to wait on before starting the next service (optional — leave blank
   for a service with nothing to poll, e.g. a background worker)
+
+The follow-up questions after picking a runner (compose project name, script
+to run, the shell command for `custom`, ...) all accept Esc to back out and
+re-pick the runner, so a wrong choice — or `custom`'s required command
+prompt — never traps you.
 
 Register in the order services should start — if you add more than one,
 you're offered a chance to reorder them (boot order matters) before saving.
@@ -89,19 +110,29 @@ project.
    (`infra/docker-compose.yml`, published at http://localhost:9999 — shows
    live logs for every container on the machine, grouped by compose project).
 2. Creates the project's shared docker network if it declared one.
-3. Prints a table of every service (runner, port, detail, current status)
-   before touching anything.
+3. Prints one status table — service / runner / detail / url / status — and
+   keeps updating it in place as the boot progresses, rather than a wall of
+   separate tables and headings. Each service's status cell moves through
+   `○ queued` → a spinning `starting (Ns)` → `● running` (its port answered),
+   `● started` (no port to check), or `✗ timeout` (its port never answered —
+   `run` moves on to the next service regardless). A dim line under the
+   table tracks which service is currently starting, and turns into the
+   `terminator window: ...` / `tmux session: ...` pointer once everything's
+   up. If stdout isn't a terminal (piped/scripted), there's no animation:
+   the table prints once up front, plain `✓ x is up on :port` lines print as
+   each service finishes, then the table prints once more at the end.
 4. Opens one pane per service in registration order — in a Terminator window
-   if it's installed, else a tmux session named `devstack-<project>`, else
-   sequentially in the background with output logged to files under the
-   system temp dir (the last service, if not `docker-compose`, then runs
-   directly in your terminal):
+   if it's installed (an even grid, at most 2 terminals per row), else a
+   tmux session named `devstack-<project>`, else sequentially in the
+   background with output logged to files under the system temp dir (the
+   last service, if not `docker-compose`, then runs directly in your
+   terminal):
    - `docker-compose` services: `up -d --build` then `logs -f` in the same pane
    - everything else: the service's actual run command, directly, in the foreground
    - if the service has a port, `run` polls it before moving on to the next one
-5. Prints a final table of each service's URL. Attaches you to the tmux
-   session if that's the backend and you're at an interactive terminal;
-   Terminator's window is already on screen, nothing further to do.
+5. Attaches you to the tmux session if that's the backend, you're at an
+   interactive terminal, and you didn't pass `-b`; Terminator's window is
+   already on screen, nothing further to do.
 
 ## Where things live
 

@@ -30,6 +30,17 @@ REGISTRY_PATH = Path.home() / ".config" / "devstack" / "registry.json"
 RUNNERS = ["docker-compose", "yarn", "pnpm", "npm", "poetry", "custom"]
 
 
+class _Back:
+    # Sentinel returned by allow_back-enabled widgets when the user presses
+    # Esc to back out of a question. Distinct from None/"" so it can never be
+    # confused with a real (empty-string) answer.
+    def __repr__(self):
+        return "BACK"
+
+
+BACK = _Back()
+
+
 # ------------------------------------------------------------------ styling
 class C:
     RESET = "\033[0m"
@@ -255,14 +266,25 @@ class _Frame:
         sys.stdout.flush()
         self.count = 0
 
+    def clear(self):
+        # The "backed out" move: erase the whole region and leave nothing
+        # behind - used when Esc backs out of a question rather than
+        # answering it, so no summary line is left to imply an answer given.
+        if self.count:
+            sys.stdout.write(f"\x1b[{self.count}A\r\x1b[J")
+            sys.stdout.flush()
+        self.count = 0
+
 
 def _collapse_line(question, answer):
     return f"{paint('✓', C.GREEN)} {dim(question)} · {answer}"
 
 
-def ask(prompt, default=None, required=False):
+def ask(prompt, default=None, required=False, allow_back=False):
     if not _interactive():
         return _ask_plain(prompt, default=default, required=required)
+    if allow_back:
+        return _ask_with_back(prompt, default=default, required=required)
     width = shutil.get_terminal_size().columns
     hint = f" (default: {default})" if default is not None else ""
     question_line = _fit_segments(
@@ -288,6 +310,54 @@ def ask(prompt, default=None, required=False):
             continue
         answer = raw
         break
+    frame.collapse(_collapse_line(prompt, answer))
+    return answer
+
+
+def _ask_with_back(prompt, default=None, required=False):
+    # allow_back=True variant of ask(): cooked input() can't be interrupted
+    # mid-line to detect Esc, so this drives its own raw-mode line editor
+    # instead - printable chars append (and are echoed via re-render),
+    # Backspace edits, Enter submits with the same default/required
+    # semantics as the cooked path, Esc returns BACK. Cursor stays visible
+    # (unlike other raw-mode widgets) since the user is typing free text.
+    width = shutil.get_terminal_size().columns
+    hint = f" (default: {default})" if default is not None else ""
+    back_hint = " (esc to go back)"
+    buffer = ""
+    error_line = None
+    frame = _Frame()
+    with _raw_mode(hide_cursor=False):
+        while True:
+            question_line = _fit_segments(
+                [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), (hint, (C.DIM,)), (back_hint, (C.DIM,))],
+                width,
+            )
+            input_line = _fit_segments([("  ", None), (buffer, None)], width)
+            lines = [question_line, input_line]
+            if error_line:
+                lines.append(error_line)
+            frame.render(lines)
+
+            key = _read_key()
+            if key == "esc":
+                frame.clear()
+                return BACK
+            if key == "enter":
+                if not buffer and default is not None:
+                    answer = default
+                    break
+                if not buffer and required:
+                    error_line = dim("    required, try again")
+                    continue
+                answer = buffer
+                break
+            if key == "backspace":
+                buffer = buffer[:-1]
+                error_line = None
+            elif len(key) == 1 and key.isprintable():
+                buffer += key
+                error_line = None
     frame.collapse(_collapse_line(prompt, answer))
     return answer
 
@@ -324,12 +394,13 @@ def ask_optional_int(prompt, default=None):
         return None
 
 
-def ask_yes_no(prompt, default=True):
+def ask_yes_no(prompt, default=True, allow_back=False):
     if not _interactive():
         return _ask_yes_no_plain(prompt, default)
     width = shutil.get_terminal_size().columns
     selected = default
     frame = _Frame()
+    back_hint = " (esc to go back)" if allow_back else ""
 
     def render_line():
         if selected:
@@ -337,7 +408,8 @@ def ask_yes_no(prompt, default=True):
         else:
             yes, no = ("  Yes", (C.DIM,)), ("❯ No", (C.BOLD, C.CYAN))
         return _fit_segments(
-            [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), ("   ", None), yes, ("    ", None), no],
+            [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), ("   ", None), yes, ("    ", None), no,
+             (back_hint, (C.DIM,))],
             width,
         )
 
@@ -353,6 +425,9 @@ def ask_yes_no(prompt, default=True):
                 selected = False
             elif key == "enter":
                 break
+            elif key == "esc" and allow_back:
+                frame.clear()
+                return BACK
     frame.collapse(_collapse_line(prompt, "Yes" if selected else "No"))
     return selected
 
@@ -369,11 +444,14 @@ def _ask_yes_no_plain(prompt, default=True):
             return False
 
 
-def ask_choice(prompt, options):
+def ask_choice(prompt, options, allow_back=False):
     if not _interactive():
         return _ask_choice_plain(prompt, options)
     width = shutil.get_terminal_size().columns
-    question_line = _fit_segments([("◆ ", (C.CYAN,)), (prompt, (C.BOLD,))], width)
+    back_hint = " (esc to go back)" if allow_back else ""
+    question_line = _fit_segments(
+        [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), (back_hint, (C.DIM,))], width
+    )
     selected = 0
     frame = _Frame()
     with _raw_mode():
@@ -394,6 +472,9 @@ def ask_choice(prompt, options):
                 selected = int(key) - 1
             elif key == "enter":
                 break
+            elif key == "esc" and allow_back:
+                frame.clear()
+                return BACK
     frame.collapse(_collapse_line(prompt, options[selected]))
     return options[selected]
 
@@ -514,33 +595,66 @@ def ask_path(prompt, default=None):
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
-def wait_for_port(port, timeout=120, host="localhost", label=None):
+def wait_for_port(port, timeout=120, host="localhost", label=None, tick=None):
     # label=None (or a non-tty stdout) keeps this exactly as silent/plain as
     # before - callers print their own ok()/err() line once this returns.
     # When a label is given on a real terminal, animate a one-line spinner in
     # place (redrawn with \r\x1b[K) so waiting doesn't look like a hang; the
     # line is cleared before returning either way so the caller's line lands
-    # clean.
+    # clean. tick=None keeps this whole path byte-for-byte as it was before
+    # tick existed.
     animate = label is not None and sys.stdout.isatty()
     deadline = time.time() + timeout
     start = time.time()
     frame_i = 0
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=2):
+
+    if tick is None:
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((host, port), timeout=2):
+                    if animate:
+                        sys.stdout.write("\r\x1b[K")
+                        sys.stdout.flush()
+                    return True
+            except OSError:
                 if animate:
-                    sys.stdout.write("\r\x1b[K")
+                    elapsed = int(time.time() - start)
+                    spinner = _SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)]
+                    frame_i += 1
+                    text = f"{spinner} waiting for {label} on :{port} ({elapsed}s)"
+                    sys.stdout.write("\r\x1b[K" + paint(text, C.DIM))
                     sys.stdout.flush()
-                return True
-        except OSError:
-            if animate:
-                elapsed = int(time.time() - start)
-                spinner = _SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)]
-                frame_i += 1
-                text = f"{spinner} waiting for {label} on :{port} ({elapsed}s)"
-                sys.stdout.write("\r\x1b[K" + paint(text, C.DIM))
-                sys.stdout.flush()
-            time.sleep(1)
+                time.sleep(1)
+        if animate:
+            sys.stdout.write("\r\x1b[K")
+            sys.stdout.flush()
+        return False
+
+    # tick given: a caller (StatusTable's per-service spinner cell) wants
+    # smooth ~4/s updates even though the actual TCP connect attempts still
+    # only retry ~once/s - so the connect itself is throttled by
+    # next_attempt while the outer loop wakes every ~0.25s to call tick().
+    next_attempt = start
+    while time.time() < deadline:
+        now = time.time()
+        if now >= next_attempt:
+            try:
+                with socket.create_connection((host, port), timeout=2):
+                    if animate:
+                        sys.stdout.write("\r\x1b[K")
+                        sys.stdout.flush()
+                    return True
+            except OSError:
+                next_attempt = time.time() + 1
+        elapsed = time.time() - start
+        spinner = _SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)]
+        frame_i += 1
+        tick(spinner, elapsed)
+        if animate:
+            text = f"{spinner} waiting for {label} on :{port} ({int(elapsed)}s)"
+            sys.stdout.write("\r\x1b[K" + paint(text, C.DIM))
+            sys.stdout.flush()
+        time.sleep(0.25)
     if animate:
         sys.stdout.write("\r\x1b[K")
         sys.stdout.flush()
@@ -593,6 +707,86 @@ def build_pane_command(svc):
     if runner == "custom":
         return f'cd "{path}" && {svc["command"]}; exec bash'
     raise ValueError(f"unknown runner {runner!r}")
+
+
+class StatusTable:
+    # Owns the single dynamic service/runner/detail/url/status table that
+    # cmd_run renders once and updates in place as the boot progresses
+    # (replaces the old three-tables-plus-per-service-headings flow - see
+    # CLAUDE.md's "run control flow"). Backends (run_terminator/run_tmux)
+    # never print their own headings or ok()/err() lines for a service's
+    # progress on a tty; they just call set_status()/set_context() here and
+    # cmd_run owns when/whether that actually redraws (animate=True on a
+    # real tty via _Frame, or left as a silent state update otherwise so the
+    # non-tty path can print the table exactly twice - once up front, once
+    # at the end - per CLAUDE.md).
+    HEADERS = ["service", "runner", "detail", "url", "status"]
+
+    def __init__(self, services):
+        self.services = services
+        self.statuses = {svc["name"]: ("○ queued", C.DIM) for svc in services}
+        self.context = None
+        self.frame = _Frame()
+
+    def _row(self, svc):
+        # One row per service; subclasses override this (plus HEADERS) for a
+        # different column set - the frame/redraw machinery below is shared,
+        # never duplicated (see StopTable).
+        detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
+        url = f"http://localhost:{svc['port']}" if svc.get("port") else "-"
+        return [svc["name"], svc["runner"], detail, url, self.statuses[svc["name"]]]
+
+    def _rows(self):
+        return [self._row(svc) for svc in self.services]
+
+    def _table_text(self):
+        return render_table(self.HEADERS, self._rows())
+
+    def draw(self):
+        # tty redraw-in-place, via the shared _Frame convention (cursor back
+        # up + erase + reprint) rather than scrolling a new table every tick.
+        lines = self._table_text().split("\n")
+        if self.context:
+            lines.append(self.context)
+        self.frame.render(lines)
+
+    def print_once(self):
+        # non-tty (or a one-shot final snapshot): plain print, no cursor
+        # movement escapes at all.
+        print(self._table_text())
+
+    def set_status(self, name, cell, animate):
+        self.statuses[name] = cell
+        if animate:
+            self.draw()
+
+    def set_context(self, text, animate):
+        self.context = text
+        if animate:
+            self.draw()
+
+
+class StopTable(StatusTable):
+    # teardown_project's variant of the run view: no url column (meaningless
+    # while tearing down), and initial statuses reflect each service's real
+    # service_running() state instead of "queued". Everything else -
+    # _Frame redraw, context line, set_status/set_context - is inherited.
+    HEADERS = ["service", "runner", "detail", "status"]
+
+    def __init__(self, services):
+        super().__init__(services)
+        for svc in services:
+            running = service_running(svc)
+            if running is True:
+                self.statuses[svc["name"]] = ("● running", C.GREEN)
+            elif running is False:
+                self.statuses[svc["name"]] = ("○ stopped", C.DIM)
+            else:
+                self.statuses[svc["name"]] = ("○ unknown", C.DIM)
+
+    def _row(self, svc):
+        detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
+        return [svc["name"], svc["runner"], detail, self.statuses[svc["name"]]]
 
 
 def ensure_network(name):
@@ -681,24 +875,40 @@ def _detect_port(path):
 
 
 def configure_runner(runner, path):
+    # Every question here is allow_back=True: this is where the "worst case"
+    # trap lived (custom's required command prompt, no way out). If ANY
+    # answer comes back BACK, propagate it immediately rather than partially
+    # filling in the returned dict - register_one_service re-asks the runner
+    # choice from scratch on BACK.
     if runner == "docker-compose":
-        return {
-            "compose_project": ask("compose project name (-p)", required=True),
-            "build": ask_yes_no("build image before starting?", default=True),
-        }
+        compose_project = ask("compose project name (-p)", required=True, allow_back=True)
+        if compose_project is BACK:
+            return BACK
+        build = ask_yes_no("build image before starting?", default=True, allow_back=True)
+        if build is BACK:
+            return BACK
+        return {"compose_project": compose_project, "build": build}
     if runner in ("yarn", "pnpm", "npm"):
         scripts = _package_json_scripts(path)
         if scripts:
             default_script = "dev" if "dev" in scripts else next(iter(scripts))
             options = [default_script] + [s for s in scripts if s != default_script]
-            script = ask_choice(f"script to run ({runner} run <script>)", options)
+            script = ask_choice(f"script to run ({runner} run <script>)", options, allow_back=True)
         else:
-            script = ask("script to run", default="dev")
+            script = ask("script to run", default="dev", allow_back=True)
+        if script is BACK:
+            return BACK
         return {"script": script}
     if runner == "poetry":
-        return {"command": ask("command to run after 'poetry run'", required=True)}
+        command = ask("command to run after 'poetry run'", required=True, allow_back=True)
+        if command is BACK:
+            return BACK
+        return {"command": command}
     if runner == "custom":
-        return {"command": ask("full shell command to run", required=True)}
+        command = ask("full shell command to run", required=True, allow_back=True)
+        if command is BACK:
+            return BACK
+        return {"command": command}
     raise ValueError(runner)
 
 
@@ -716,8 +926,18 @@ def register_one_service(project_slug, existing_names):
     if detected and detected in RUNNERS:
         runner_options = [detected] + [r for r in RUNNERS if r != detected]
         print(dim(f"    detected: {detected} (based on files in {path})"))
-    runner = ask_choice("how is it run?", runner_options)
-    extra = configure_runner(runner, path)
+
+    # runner ask_choice does NOT get allow_back - there's nothing sensible to
+    # back out to before it, so Esc there is simply ignored (stays put).
+    # configure_runner's own follow-up questions do get allow_back; if the
+    # user backs out of one of those, loop back and re-ask the runner choice
+    # (detection/pre-fills behave the same on re-entry since runner_options
+    # was already computed above).
+    while True:
+        runner = ask_choice("how is it run?", runner_options)
+        extra = configure_runner(runner, path)
+        if extra is not BACK:
+            break
 
     default_port = _detect_port(path)
     if default_port:
@@ -882,20 +1102,82 @@ def running_projects(registry, exclude=None):
 def teardown_project(name, entry):
     heading(f"Stopping '{name}'")
     rows = []
-    for svc in entry["services"]:
-        detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
-        rows.append([svc["name"], svc["runner"], detail])
-    print(render_table(["service", "runner", "detail"], rows))
-
-    for svc in reversed(entry["services"]):
-        if svc["runner"] == "docker-compose":
-            print(f"  stopping {paint(svc['name'], C.BOLD)}...")
-            subprocess.run(["docker", "compose", "-p", svc["compose_project"], "down"])
-
+    services = entry["services"]
     session = tmux_session_name(name)
+
+    if not sys.stdout.isatty():
+        # Non-tty keeps the pre-dynamic behavior exactly: static table once,
+        # docker compose's own output streaming straight through, plain ok()
+        # lines. Mirrors cmd_run's animate split.
+        rows = []
+        for svc in services:
+            detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
+            rows.append([svc["name"], svc["runner"], detail])
+        print(render_table(["service", "runner", "detail"], rows))
+        for svc in reversed(services):
+            if svc["runner"] == "docker-compose":
+                print(f"  stopping {paint(svc['name'], C.BOLD)}...")
+                subprocess.run(["docker", "compose", "-p", svc["compose_project"], "down"])
+        if shutil.which("tmux") and tmux_has_session(session):
+            subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+            ok(f"killed tmux session '{session}'")
+        return
+
+    # tty: same treatment as the run view - ONE table (StopTable), rendered
+    # once with real service_running() statuses, updated in place. Compose's
+    # own output is captured (Popen+PIPE) rather than streamed: any
+    # subprocess writing to stdout mid-frame would land inside the _Frame
+    # region and corrupt the next redraw, so it's swallowed on success (the
+    # table already says stopped) and printed *after* the frame is finalized
+    # on failure. Docker teardown still runs in REVERSE boot order
+    # (deliberate - dependents come down before their dependencies); the
+    # table's display rows stay in boot order.
+    table = StopTable(services)
+    table.draw()
+    failures = []  # (svc_name, captured compose output)
+
+    compose_services = [s for s in reversed(services) if s["runner"] == "docker-compose"]
+    total = len(compose_services)
+    for i, svc in enumerate(compose_services):
+        svc_name = svc["name"]
+        proc = subprocess.Popen(
+            ["docker", "compose", "-p", svc["compose_project"], "down"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        start = time.time()
+        frame_i = 0
+        while proc.poll() is None:
+            spinner = _SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)]
+            frame_i += 1
+            elapsed = int(time.time() - start)
+            table.set_status(svc_name, (f"{spinner} stopping ({elapsed}s)", C.YELLOW), animate=False)
+            table.set_context(dim(f"{spinner} stopping {svc_name} ({i + 1}/{total})"), animate=True)
+            time.sleep(0.25)
+        output = proc.stdout.read() if proc.stdout else ""
+        if proc.returncode == 0:
+            table.set_status(svc_name, ("○ stopped", C.DIM), animate=True)
+        else:
+            table.set_status(svc_name, ("✗ error", C.RED), animate=True)
+            failures.append((svc_name, output))
+
+    killed = False
     if shutil.which("tmux") and tmux_has_session(session):
-        subprocess.run(["tmux", "kill-session", "-t", session], check=True)
-        ok(f"killed tmux session '{session}'")
+        subprocess.run(["tmux", "kill-session", "-t", session], check=True, capture_output=True)
+        killed = True
+    # Non-docker services die with the tmux session's panes (or were never
+    # tracked at all if there's no session) - flip them to stopped either way.
+    for svc in services:
+        if svc["runner"] != "docker-compose":
+            table.set_status(svc["name"], ("○ stopped", C.DIM), animate=False)
+    final_context = dim(f"killed tmux session '{session}'") if killed else None
+    table.set_context(final_context, animate=True)
+
+    # Only now, with the frame finalized (nothing redraws above this point),
+    # is it safe to print captured compose output for any failures.
+    for svc_name, output in failures:
+        err(f"docker compose down failed for {svc_name}:")
+        if output:
+            sys.stdout.write(output if output.endswith("\n") else output + "\n")
 
 
 def check_other_running(registry, name):
@@ -928,15 +1210,31 @@ def check_other_running(registry, name):
             teardown_project(o, registry[o])
 
 
-def run_tmux(name, entry):
+def run_tmux(name, entry, table, animate):
+    # Reports progress through `table` (a StatusTable) instead of printing
+    # its own "── Starting X ──" headings / ok()/err() lines - cmd_run owns
+    # the single dynamic table those used to be scattered across. `animate`
+    # mirrors cmd_run's tty check: when False, status changes only update
+    # table's internal state (no redraw), and the ok()/err() lines below are
+    # the non-tty fallback text (see CLAUDE.md).
     services = entry["services"]
     session = tmux_session_name(name)
     if tmux_has_session(session):
-        ok(f"session '{session}' already running")
+        for svc in services:
+            status = ("● running", C.GREEN) if service_running(svc) else ("○ stopped", C.DIM)
+            table.set_status(svc["name"], status, animate=False)
+        if not animate:
+            ok(f"session '{session}' already running")
         return
+
+    total = len(services)
     for i, svc in enumerate(services):
+        svc_name = svc["name"]
+        table.set_status(svc_name, (f"{_SPINNER_FRAMES[0]} starting (0s)", C.YELLOW), animate=animate)
+        table.set_context(
+            dim(f"{_SPINNER_FRAMES[0]} starting {svc_name} ({i + 1}/{total})"), animate=animate
+        )
         cmd = build_pane_command(svc)
-        heading(f"Starting {svc['name']}")
         if i == 0:
             subprocess.run(
                 ["tmux", "new-session", "-d", "-s", session, "-n", "main", cmd],
@@ -945,10 +1243,22 @@ def run_tmux(name, entry):
         else:
             subprocess.run(["tmux", "split-window", "-t", session, cmd], check=True)
         if svc.get("port"):
-            if wait_for_port(svc["port"], label=svc["name"]):
-                ok(f"{svc['name']} is up on :{svc['port']}")
+            def tick(spinner, elapsed, svc_name=svc_name, i=i):
+                table.set_status(svc_name, (f"{spinner} starting ({int(elapsed)}s)", C.YELLOW), animate=True)
+                table.set_context(
+                    dim(f"{spinner} starting {svc_name} ({i + 1}/{total})"), animate=True
+                )
+            up = wait_for_port(svc["port"], tick=tick if animate else None)
+            if up:
+                table.set_status(svc_name, ("● running", C.GREEN), animate=animate)
+                if not animate:
+                    ok(f"{svc_name} is up on :{svc['port']}")
             else:
-                err(f"timed out waiting for {svc['name']} on :{svc['port']}")
+                table.set_status(svc_name, ("✗ timeout", C.RED), animate=animate)
+                if not animate:
+                    err(f"timed out waiting for {svc_name} on :{svc['port']}")
+        else:
+            table.set_status(svc_name, ("● started", C.GREEN), animate=animate)
     subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
 
 
@@ -962,41 +1272,73 @@ def _configobj_value(value):
 
 
 def _terminator_layout(services):
-    # Nested HPaned chain -> N terminals side by side, one per service, in
-    # boot order left-to-right. Schema reverse-engineered from the installed
-    # terminatorlib source (config.py DEFAULTS['layouts'], terminal.py
-    # describe_layout/create_layout, paned.py create_layout) since it isn't
-    # documented: a Paned widget (HPaned/VPaned) always has exactly 2
-    # children, distinguished by their own 'order' field (0 = left/top,
-    # 1 = right/bottom) relative to that shared parent.
+    # Grid layout: at most 2 terminals per row, rows stacked top-to-bottom,
+    # boot order mapping left-to-right then top-to-bottom. Schema
+    # reverse-engineered from the installed terminatorlib source (config.py
+    # DEFAULTS['layouts'], terminal.py describe_layout/create_layout,
+    # paned.py create_layout) since it isn't documented: a Paned widget
+    # (HPaned/VPaned) always has exactly 2 children, distinguished by their
+    # own 'order' field (0 = left/top, 1 = right/bottom) relative to that
+    # shared parent - so a full row of 2 is one HPaned, and rows are chained
+    # together vertically through nested VPaneds (the same "chain through
+    # a single parent" trick the old side-by-side-only version used, just
+    # one level up: chaining rows instead of chaining terminals directly).
+    # Shapes this produces: N=1 -> single Terminal. N=2 -> one HPaned(t0,t1).
+    # N=3 -> VPaned(HPaned(t0,t1), t2). N=4 -> VPaned(HPaned(t0,t1),
+    # HPaned(t2,t3)). N=5 -> VPaned(HPaned(t0,t1), VPaned(HPaned(t2,t3), t4)).
     layout = {"window0": {"type": "Window", "parent": ""}}
-    if len(services) == 1:
+    n = len(services)
+    if n == 1:
         layout["terminal0"] = {
             "type": "Terminal", "parent": "window0", "order": 0,
             "profile": "default", "command": build_pane_command(services[0]),
         }
         return layout
 
-    parent = "window0"
-    for i, svc in enumerate(services[:-1]):
-        pane_id = f"hpaned{i}"
-        layout[pane_id] = {"type": "HPaned", "parent": parent, "order": 1}
-        layout[f"terminal{i}"] = {
-            "type": "Terminal", "parent": pane_id, "order": 0,
-            "profile": "default", "command": build_pane_command(svc),
+    def add_terminal(index, parent, order):
+        layout[f"terminal{index}"] = {
+            "type": "Terminal", "parent": parent, "order": order,
+            "profile": "default", "command": build_pane_command(services[index]),
         }
-        parent = pane_id
-    layout[f"terminal{len(services) - 1}"] = {
-        "type": "Terminal", "parent": parent, "order": 1,
-        "profile": "default", "command": build_pane_command(services[-1]),
-    }
+
+    def build_row(indices, parent, order, row_num):
+        # A row of 1 (only possible for the trailing row on odd N) attaches
+        # its lone terminal directly; a row of 2 becomes its own HPaned.
+        if len(indices) == 1:
+            add_terminal(indices[0], parent, order)
+            return
+        hpaned_id = f"hpaned{row_num}"
+        layout[hpaned_id] = {"type": "HPaned", "parent": parent, "order": order}
+        add_terminal(indices[0], hpaned_id, 0)
+        add_terminal(indices[1], hpaned_id, 1)
+
+    rows = [list(range(i, min(i + 2, n))) for i in range(0, n, 2)]
+    if len(rows) == 1:
+        build_row(rows[0], "window0", 0, 0)
+        return layout
+
+    parent = "window0"
+    for row_num, row in enumerate(rows[:-1]):
+        vpaned_id = f"vpaned{row_num}"
+        layout[vpaned_id] = {"type": "VPaned", "parent": parent, "order": 1}
+        build_row(row, vpaned_id, 0, row_num)
+        parent = vpaned_id
+    build_row(rows[-1], parent, 1, len(rows) - 1)
     return layout
 
 
-def run_terminator(name, entry):
+def run_terminator(name, entry, table, animate):
+    # Same table-reporting contract as run_tmux above. Terminator has no
+    # per-pane launch step to straddle (the whole layout opens in one Popen
+    # call), so the per-service loop below is purely the port-polling
+    # sequence - but it still walks services in boot order and marks each
+    # "starting" before polling, so the table reads the same progression.
     services = entry["services"]
     if services and all(service_running(s) for s in services):
-        ok(f"'{name}' looks like it's already running")
+        for svc in services:
+            table.set_status(svc["name"], ("● running", C.GREEN), animate=False)
+        if not animate:
+            ok(f"'{name}' looks like it's already running")
         return
 
     layout_name = f"devstack-{name}"
@@ -1011,27 +1353,51 @@ def run_terminator(name, entry):
         tf.write("\n".join(lines) + "\n")
         config_path = tf.name
 
-    heading(f"Starting {name} (terminator)")
     subprocess.Popen([
         "terminator", "-u", "-g", config_path, "-l", layout_name,
         "-T", f"devstack: {name}",
     ])
-    for svc in services:
+
+    total = len(services)
+    for i, svc in enumerate(services):
+        svc_name = svc["name"]
+        table.set_status(svc_name, (f"{_SPINNER_FRAMES[0]} starting (0s)", C.YELLOW), animate=animate)
+        table.set_context(
+            dim(f"{_SPINNER_FRAMES[0]} starting {svc_name} ({i + 1}/{total})"), animate=animate
+        )
         if svc.get("port"):
-            if wait_for_port(svc["port"], label=svc["name"]):
-                ok(f"{svc['name']} is up on :{svc['port']}")
+            def tick(spinner, elapsed, svc_name=svc_name, i=i):
+                table.set_status(svc_name, (f"{spinner} starting ({int(elapsed)}s)", C.YELLOW), animate=True)
+                table.set_context(
+                    dim(f"{spinner} starting {svc_name} ({i + 1}/{total})"), animate=True
+                )
+            up = wait_for_port(svc["port"], tick=tick if animate else None)
+            if up:
+                table.set_status(svc_name, ("● running", C.GREEN), animate=animate)
+                if not animate:
+                    ok(f"{svc_name} is up on :{svc['port']}")
             else:
-                err(f"timed out waiting for {svc['name']} on :{svc['port']}")
+                table.set_status(svc_name, ("✗ timeout", C.RED), animate=animate)
+                if not animate:
+                    err(f"timed out waiting for {svc_name} on :{svc['port']}")
+        else:
+            table.set_status(svc_name, ("● started", C.GREEN), animate=animate)
 
 
-def run_fallback(name, entry):
+def run_fallback(name, entry, background=False):
+    # background=True (run -b when tmux isn't available either) skips the
+    # exec-last-service-into-the-foreground special case below - every
+    # service gets the same Popen+logfile treatment and control returns to
+    # the shell. Those Popen'd processes are fire-and-forget: devstack keeps
+    # no pid file, so `stop` can't kill non-docker services started this way
+    # (see CLAUDE.md's "run control flow" for the honest limitation note).
     warn("neither terminator nor tmux found - running services sequentially, no split panes.")
     services = entry["services"]
     for i, svc in enumerate(services):
         is_last = i == len(services) - 1
         cmd = build_pane_command(svc)
         heading(f"Starting {svc['name']}")
-        if is_last and svc["runner"] != "docker-compose":
+        if not background and is_last and svc["runner"] != "docker-compose":
             print(dim(f"    {cmd}"))
             os.execvp("bash", ["bash", "-c", cmd])
             return  # unreachable
@@ -1063,46 +1429,70 @@ def cmd_run(args):
     services = entry["services"]
 
     heading(f"Starting '{args.name}'")
-    rows = []
-    for svc in services:
-        detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
-        port = f"localhost:{svc['port']}" if svc.get("port") else "-"
-        status = ("● running", C.GREEN) if service_running(svc) else ("○ stopped", C.DIM)
-        rows.append([svc["name"], svc["runner"], port, detail, status])
-    print(render_table(["service", "runner", "port", "detail", "status"], rows))
 
-    backend = "terminator" if shutil.which("terminator") else (
-        "tmux" if shutil.which("tmux") else None
-    )
-    if backend is None:
-        run_fallback(args.name, entry)
-        return
-    if backend == "terminator":
-        run_terminator(args.name, entry)
+    # -b/--background changes the backend priority: terminator is skipped
+    # entirely (a GUI window is inherently foreground - the whole point of
+    # the flag is to not open one), so it's tmux (detached, no attach at the
+    # end) or the fallback in background mode.
+    background = getattr(args, "background", False)
+    if background:
+        backend = "tmux" if shutil.which("tmux") else None
     else:
-        run_tmux(args.name, entry)
+        backend = "terminator" if shutil.which("terminator") else (
+            "tmux" if shutil.which("tmux") else None
+        )
+    if backend is None:
+        # run_fallback is deliberately thin (CLAUDE.md) - it keeps its own
+        # sequential prints and label-based spinner rather than going
+        # through StatusTable, since there are no panes/session for a
+        # dynamic table to describe here anyway.
+        run_fallback(args.name, entry, background=background)
+        return
 
-    heading(args.name)
-    url_rows = []
-    for svc in services:
-        status = ("● running", C.GREEN) if service_running(svc) else ("○ stopped", C.DIM)
-        url = f"http://localhost:{svc['port']}" if svc.get("port") else "(no port)"
-        url_rows.append([svc["name"], status, url])
-    url_rows.append(["logs (all)", ("● running", C.GREEN), DOZZLE_URL])
-    print(render_table(["service", "status", "url"], url_rows))
+    # ONE table for the whole boot, rendered once up front and then updated
+    # in place as each service starts (tty) - or printed once now and once
+    # more at the end, with plain ok()/err() lines in between (non-tty). See
+    # CLAUDE.md's "run control flow".
+    animate = sys.stdout.isatty()
+    table = StatusTable(services)
+    if animate:
+        table.draw()
+    else:
+        table.print_once()
+
+    if backend == "terminator":
+        run_terminator(args.name, entry, table, animate)
+    else:
+        run_tmux(args.name, entry, table, animate)
 
     if backend == "tmux":
         session = tmux_session_name(args.name)
-        print(f"\ntmux session: {session}")
+        if background:
+            pointer = (
+                f"tmux session: {session} "
+                f"(detached — attach with: tmux attach -t {session})"
+            )
+        else:
+            pointer = f"tmux session: {session}"
+    else:
+        pointer = f"terminator window: devstack: {args.name}"
+
+    if animate:
+        table.set_context(dim(pointer), animate=True)
+    else:
+        table.print_once()
+        print(pointer)
+    print(dim(f"logs: {DOZZLE_URL}"))
+
+    if backend == "tmux" and not background:
+        session = tmux_session_name(args.name)
         if sys.stdout.isatty():
             os.execvp("tmux", ["tmux", "attach", "-t", session])
         else:
             print(f"Attach with: tmux attach -t {session}")
-    else:
-        print(f"\nterminator window: devstack: {args.name}")
 
 
-def cmd_down(args):
+def cmd_stop(args):
     registry = load_registry()
     entry = registry.get(args.name)
     if entry is None:
@@ -1112,12 +1502,21 @@ def cmd_down(args):
     teardown_project(args.name, entry)
 
 
+def cmd_down(args):
+    # Deprecated alias for 'stop' - kept working (hidden from --help and
+    # COMMANDS_HELP via argparse.SUPPRESS) so muscle memory and old scripts
+    # don't break, but nudges toward the new name. 'infra down' is untouched:
+    # that's compose terminology in a different namespace.
+    print(dim("'down' is now 'stop'"))
+    cmd_stop(args)
+
+
 COMMANDS_HELP = [
     ("register <name>", "interactively define a project's services"),
     ("edit <name>", "open a project's config in $EDITOR"),
     ("list", "show registered projects and live status"),
-    ("run <name>", "boot a registered project's stack"),
-    ("down <name>", "tear down a registered project's stack"),
+    ("run <name> [-b]", "boot a registered project's stack (-b: background, no attach/window)"),
+    ("stop <name>", "tear down a project's stack"),
     ("infra up|down", "manage the shared Dozzle log viewer"),
 ]
 
@@ -1133,7 +1532,14 @@ def print_help():
         cmd_col = paint(f"{cmd:<{width}}", C.BOLD, C.CYAN)
         print(f"  {cmd_col}  {dim(desc)}")
     heading("EXAMPLES")
-    for line in ("devstack register lawial", "devstack run lawial", "devstack list"):
+    examples = (
+        "devstack register lawial",
+        "devstack run lawial",
+        "devstack run lawial -b   # background: no window, no attach",
+        "devstack stop lawial",
+        "devstack list",
+    )
+    for line in examples:
         print(dim(f"  {line}"))
     print(f"\n{dim('logs:')} {DOZZLE_URL}")
 
@@ -1155,9 +1561,18 @@ def build_parser():
 
     p = sub.add_parser("run", help="boot a registered project's stack")
     p.add_argument("name", help="project name")
+    p.add_argument(
+        "-b", "--background", action="store_true",
+        help="boot detached: no GUI window, no tmux attach (tmux or fallback only)",
+    )
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("down", help="tear down a registered project's stack")
+    p = sub.add_parser("stop", help="tear down a registered project's stack")
+    p.add_argument("name", help="project name")
+    p.set_defaults(func=cmd_stop)
+
+    # deprecated alias for 'stop' - hidden from help, still functional
+    p = sub.add_parser("down", help=argparse.SUPPRESS)
     p.add_argument("name", help="project name")
     p.set_defaults(func=cmd_down)
 
