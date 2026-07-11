@@ -1,12 +1,14 @@
-# bash completion for devstack
+# bash completion for sspinner
 # sourced by install.sh from ~/.bashrc - no bash-completion package required
 
-_devstack() {
+_sspinner() {
     local cur cword
     cur="${COMP_WORDS[COMP_CWORD]}"
     cword=$COMP_CWORD
 
-    local commands="register edit list run down infra"
+    # 'down' is a deprecated alias for 'stop' - still completes since it
+    # still works, but 'stop' is the advertised name
+    local commands="register edit list run stop down infra"
 
     if [ "$cword" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -15,10 +17,10 @@ _devstack() {
 
     local sub="${COMP_WORDS[1]}"
     case "$sub" in
-        register|edit|run|down)
+        register|edit|run|stop|down)
             if [ "$cword" -eq 2 ]; then
                 local names
-                names=$(devstack _names 2>/dev/null)
+                names=$(sspinner _names 2>/dev/null)
                 COMPREPLY=( $(compgen -W "$names" -- "$cur") )
             fi
             ;;
@@ -31,4 +33,4 @@ _devstack() {
     return 0
 }
 
-complete -F _devstack devstack
+complete -F _sspinner sspinner

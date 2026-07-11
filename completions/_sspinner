@@ -1,14 +1,15 @@
-#compdef devstack
-# zsh completion for devstack - autoloaded via fpath by install.sh
+#compdef sspinner
+# zsh completion for sspinner - autoloaded via fpath by install.sh
 
-_devstack() {
+_sspinner() {
     local -a commands
     commands=(
         'register:interactively define a project'"'"'s services'
         'edit:open a project'"'"'s config in $EDITOR'
         'list:show registered projects and live status'
         'run:boot a registered project'"'"'s stack'
-        'down:tear down a registered project'"'"'s stack'
+        'stop:tear down a registered project'"'"'s stack'
+        'down:deprecated alias for stop'
         'infra:manage the shared Dozzle log viewer'
     )
 
@@ -18,10 +19,10 @@ _devstack() {
     fi
 
     case ${words[2]} in
-        register|edit|run|down)
+        register|edit|run|stop|down)
             if (( CURRENT == 3 )); then
                 local -a names
-                names=(${(f)"$(devstack _names 2>/dev/null)"})
+                names=(${(f)"$(sspinner _names 2>/dev/null)"})
                 _describe 'project' names
             fi
             ;;
@@ -35,4 +36,4 @@ _devstack() {
     esac
 }
 
-_devstack
+_sspinner

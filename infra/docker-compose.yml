@@ -1,7 +1,7 @@
 services:
   dozzle:
     image: amir20/dozzle:latest
-    container_name: devstack-dozzle
+    container_name: sspinner-dozzle
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
