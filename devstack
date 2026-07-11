@@ -4,17 +4,20 @@
 See CLAUDE.md in this repo for the full design write-up.
 """
 import argparse
-import curses
+import contextlib
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import termios
 import time
+import tty
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -32,6 +35,7 @@ class C:
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
+    REVERSE = "\033[7m"
     RED = "\033[31m"
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
@@ -50,7 +54,13 @@ def paint(text, *codes):
 
 
 def heading(text):
-    print(paint(f"\n{text}", C.BOLD, C.CYAN))
+    # Lightweight section rule, not a box - boxes are reserved for
+    # render_table(). Width of the trailing rule is computed off the plain
+    # text first (CLAUDE.md styling rule), so it always lands at ~60 cols
+    # regardless of how the title is colorized.
+    prefix_plain = f"── {text} "
+    rule = "─" * max(4, 60 - len(prefix_plain))
+    print("\n" + paint(f"── {text}", C.BOLD, C.CYAN) + " " + dim(rule))
 
 
 def ok(text):
@@ -84,12 +94,12 @@ def render_table(headers, rows):
     def hline(left, mid, right):
         return left + mid.join("─" * (w + 2) for w in widths) + right
 
-    def render_row(cells, bold=False):
+    def render_row(cells, header=False):
         parts = []
         for i, cell in enumerate(cells):
             padded = f"{cell_text(cell):<{widths[i]}}"
-            if bold:
-                parts.append(paint(padded, C.BOLD))
+            if header:
+                parts.append(paint(padded, C.BOLD, C.CYAN))
             elif isinstance(cell, tuple):
                 parts.append(paint(padded, *cell[1:]))
             else:
@@ -97,13 +107,13 @@ def render_table(headers, rows):
         return "│ " + " │ ".join(parts) + " │"
 
     lines = [
-        "  " + hline("┌", "┬", "┐"),
-        "  " + render_row(headers, bold=True),
+        "  " + hline("╭", "┬", "╮"),
+        "  " + render_row(headers, header=True),
         "  " + hline("├", "┼", "┤"),
     ]
     for row in rows:
         lines.append("  " + render_row(row))
-    lines.append("  " + hline("└", "┴", "┘"))
+    lines.append("  " + hline("╰", "┴", "╯"))
     return "\n".join(lines)
 
 
@@ -124,7 +134,165 @@ def slugify(text):
 
 
 # ------------------------------------------------------------- interactive
+# Every widget below renders inline, in the normal screen buffer - never the
+# alternate screen (no \x1b[?1049h/smcup, ever). That switch is what made the
+# old alternate-screen picker feel like "a new terminal had opened"; these
+# widgets instead draw a small block of lines in place, redraw it in place on
+# every keystroke, then collapse it to a single one-line summary when done,
+# the same way Claude Code's own prompts feel. Every widget also has a plain
+# input()-based fallback used whenever stdin/stdout isn't a real tty, so the
+# scripted pipe-driven `register` flow described in CLAUDE.md keeps working
+# unchanged - same questions, same order, same accepted answers.
+def _interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+@contextlib.contextmanager
+def _raw_mode(hide_cursor=True):
+    # cbreak, not full raw: read one keypress at a time but leave signal
+    # processing (Ctrl-C) and output post-processing alone. Always restores
+    # the original terminal settings on the way out, including when a
+    # KeyboardInterrupt unwinds through the 'with' block.
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    if hide_cursor:
+        sys.stdout.write("\x1b[?25l")
+        sys.stdout.flush()
+    try:
+        tty.setcbreak(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        if hide_cursor:
+            sys.stdout.write("\x1b[?25h")
+            sys.stdout.flush()
+
+
+_ARROW_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left"}
+
+
+def _read_one(fd):
+    # Unbuffered single-byte read straight off the fd via os.read(), not
+    # sys.stdin.read(). TextIOWrapper's own internal buffering can silently
+    # slurp more bytes than requested from the OS on one call, so a later
+    # select() on the raw fd sees nothing pending even though a full escape
+    # sequence is already sitting in Python's buffer - that mismatch is what
+    # breaks arrow-key detection below if sys.stdin.read(1) is used instead.
+    return os.read(fd, 1).decode(errors="replace")
+
+
+def _read_key():
+    # Decodes one keypress to a symbolic name where it makes sense (arrow
+    # keys, tab, enter, backspace, esc), otherwise returns the raw printable
+    # character. A bare Esc and the start of an arrow-key escape sequence
+    # both begin with \x1b, so a short select() timeout is used to tell them
+    # apart without blocking forever on a lone Esc press.
+    fd = sys.stdin.fileno()
+    ch = _read_one(fd)
+    if ch == "\x03":
+        raise KeyboardInterrupt
+    if ch == "\x1b":
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if not ready:
+            return "esc"
+        ch2 = _read_one(fd)
+        if ch2 != "[":
+            return "esc"
+        ch3 = _read_one(fd)
+        return _ARROW_KEYS.get(ch3, "esc")
+    if ch in ("\r", "\n"):
+        return "enter"
+    if ch == "\t":
+        return "tab"
+    if ch in ("\x7f", "\x08"):
+        return "backspace"
+    return ch
+
+
+def _fit_segments(segments, width=None):
+    # segments: [(plain_text, paint_codes_or_None), ...]. Truncation happens
+    # on the plain text *before* colorizing (same rule render_table() follows
+    # per CLAUDE.md styling notes), and the running width is clamped to the
+    # terminal's current column count so a wrapped line can never corrupt the
+    # redraw math in _Frame below.
+    if width is None:
+        width = shutil.get_terminal_size().columns
+    out = []
+    used = 0
+    for text, codes in segments:
+        remaining = width - used
+        if remaining <= 0:
+            break
+        if len(text) > remaining:
+            text = text[:remaining]
+        used += len(text)
+        out.append(paint(text, *codes) if codes else text)
+    return "".join(out)
+
+
+class _Frame:
+    # Tracks how many lines the widget's previous draw used, so the next
+    # draw can move the cursor back up over exactly that many lines
+    # (\x1b[<n>A + \r) and erase everything below (\x1b[J) before reprinting,
+    # rather than scrolling the screen on every keystroke.
+    def __init__(self):
+        self.count = 0
+
+    def render(self, lines):
+        if self.count:
+            sys.stdout.write(f"\x1b[{self.count}A\r\x1b[J")
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        self.count = len(lines)
+
+    def collapse(self, summary_line):
+        # The signature "finished" move: erase the whole region and leave a
+        # single one-line summary behind (green check + dim question +
+        # normal-weight answer).
+        if self.count:
+            sys.stdout.write(f"\x1b[{self.count}A\r\x1b[J")
+        sys.stdout.write(summary_line + "\n")
+        sys.stdout.flush()
+        self.count = 0
+
+
+def _collapse_line(question, answer):
+    return f"{paint('✓', C.GREEN)} {dim(question)} · {answer}"
+
+
 def ask(prompt, default=None, required=False):
+    if not _interactive():
+        return _ask_plain(prompt, default=default, required=required)
+    width = shutil.get_terminal_size().columns
+    hint = f" (default: {default})" if default is not None else ""
+    question_line = _fit_segments(
+        [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), (hint, (C.DIM,))], width
+    )
+    frame = _Frame()
+    error_line = None
+    while True:
+        lines = [question_line]
+        if error_line:
+            lines.append(error_line)
+        frame.render(lines)
+        # Plain input() (cooked mode) is fine here - readline-style editing
+        # isn't required, and cooked mode is what lets backspace/line-editing
+        # work for free while typing.
+        raw = input("  ").strip()
+        frame.count += 1  # account for the line input() itself just echoed
+        if not raw and default is not None:
+            answer = default
+            break
+        if not raw and required:
+            error_line = dim("    required, try again")
+            continue
+        answer = raw
+        break
+    frame.collapse(_collapse_line(prompt, answer))
+    return answer
+
+
+def _ask_plain(prompt, default=None, required=False):
     suffix = f" [{default}]" if default is not None else ""
     while True:
         raw = input(paint(f"  {prompt}{suffix}: ", C.BOLD)).strip()
@@ -157,6 +325,39 @@ def ask_optional_int(prompt, default=None):
 
 
 def ask_yes_no(prompt, default=True):
+    if not _interactive():
+        return _ask_yes_no_plain(prompt, default)
+    width = shutil.get_terminal_size().columns
+    selected = default
+    frame = _Frame()
+
+    def render_line():
+        if selected:
+            yes, no = ("❯ Yes", (C.BOLD, C.CYAN)), ("  No", (C.DIM,))
+        else:
+            yes, no = ("  Yes", (C.DIM,)), ("❯ No", (C.BOLD, C.CYAN))
+        return _fit_segments(
+            [("◆ ", (C.CYAN,)), (prompt, (C.BOLD,)), ("   ", None), yes, ("    ", None), no],
+            width,
+        )
+
+    with _raw_mode():
+        while True:
+            frame.render([render_line()])
+            key = _read_key()
+            if key in ("left", "right", "tab"):
+                selected = not selected
+            elif key in ("y", "Y"):
+                selected = True
+            elif key in ("n", "N"):
+                selected = False
+            elif key == "enter":
+                break
+    frame.collapse(_collapse_line(prompt, "Yes" if selected else "No"))
+    return selected
+
+
+def _ask_yes_no_plain(prompt, default=True):
     suffix = "Y/n" if default else "y/N"
     while True:
         raw = input(paint(f"  {prompt} [{suffix}]: ", C.BOLD)).strip().lower()
@@ -166,6 +367,46 @@ def ask_yes_no(prompt, default=True):
             return True
         if raw in ("n", "no"):
             return False
+
+
+def ask_choice(prompt, options):
+    if not _interactive():
+        return _ask_choice_plain(prompt, options)
+    width = shutil.get_terminal_size().columns
+    question_line = _fit_segments([("◆ ", (C.CYAN,)), (prompt, (C.BOLD,))], width)
+    selected = 0
+    frame = _Frame()
+    with _raw_mode():
+        while True:
+            lines = [question_line]
+            for i, opt in enumerate(options):
+                if i == selected:
+                    lines.append(_fit_segments([("  ❯ ", (C.CYAN,)), (opt, (C.BOLD,))], width))
+                else:
+                    lines.append(_fit_segments([(f"    {opt}", (C.DIM,))], width))
+            frame.render(lines)
+            key = _read_key()
+            if key == "up":
+                selected = (selected - 1) % len(options)
+            elif key == "down":
+                selected = (selected + 1) % len(options)
+            elif key.isdigit() and key != "0" and int(key) <= len(options):
+                selected = int(key) - 1
+            elif key == "enter":
+                break
+    frame.collapse(_collapse_line(prompt, options[selected]))
+    return options[selected]
+
+
+def _ask_choice_plain(prompt, options):
+    print(paint(f"  {prompt}", C.BOLD))
+    for i, opt in enumerate(options, 1):
+        print(f"    {i}) {opt}")
+    while True:
+        raw = input(paint("  > ", C.BOLD)).strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1]
+        print(dim(f"    enter a number 1-{len(options)}"))
 
 
 def _ask_path_plain(prompt, default=None):
@@ -196,107 +437,113 @@ def _path_suggestions(buffer, limit=10):
     return base, entries[:limit]
 
 
-def _safe_addstr(stdscr, y, x, text, attr=0):
-    maxy, maxx = stdscr.getmaxyx()
-    if y < 0 or y >= maxy or x < 0 or x >= maxx:
-        return
-    stdscr.addstr(y, x, text[: max(0, maxx - x - 1)], attr)
-
-
-def _pick_path_curses(stdscr, prompt, default):
-    try:
-        curses.curs_set(1)
-    except curses.error:
-        pass
-    stdscr.keypad(True)
-    buffer = default or ""
-    selected = 0
-    error = ""
-
-    while True:
-        base, suggestions = _path_suggestions(buffer)
-        selected = max(0, min(selected, len(suggestions) - 1)) if suggestions else 0
-
-        stdscr.erase()
-        maxy, _ = stdscr.getmaxyx()
-        _safe_addstr(stdscr, 0, 0, f"{prompt}: {buffer}", curses.A_BOLD)
-        row = 2
-        if error:
-            _safe_addstr(stdscr, row, 2, error)
-            row += 2
-        for i, s in enumerate(suggestions):
-            if row + i >= maxy - 2:
-                break
-            attr = curses.A_REVERSE if i == selected else 0
-            _safe_addstr(stdscr, row + i, 2, str(s) + "/", attr)
-        _safe_addstr(
-            stdscr, maxy - 1, 0,
-            "up/down move  tab descend  enter select  ctrl-c cancel",
-        )
-        stdscr.refresh()
-        error = ""
-
-        key = stdscr.getch()
-        if key == curses.KEY_UP and suggestions:
-            selected = (selected - 1) % len(suggestions)
-        elif key == curses.KEY_DOWN and suggestions:
-            selected = (selected + 1) % len(suggestions)
-        elif key in (9, curses.KEY_RIGHT) and suggestions:
-            buffer = str(suggestions[selected]) + "/"
-            selected = 0
-        elif key in (10, 13, curses.KEY_ENTER):
-            candidate = buffer
-            expanded_candidate = os.path.expanduser(candidate)
-            if not os.path.isdir(expanded_candidate) and suggestions:
-                candidate = str(suggestions[selected])
-                expanded_candidate = candidate
-            path = Path(expanded_candidate).resolve()
-            if path.is_dir():
-                return str(path)
-            error = f"'{candidate}' isn't a directory, try again"
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            buffer = buffer[:-1]
-            selected = 0
-        elif key == 27:  # Esc - clear and start over
-            buffer = ""
-            selected = 0
-        elif 32 <= key <= 126:
-            buffer += chr(key)
-            selected = 0
-
-
 def ask_path(prompt, default=None):
-    # Live dropdown of matching subdirectories, closer to an '@'-mention
-    # picker than plain tab completion. Falls back to plain input() when
-    # there's no real terminal to draw into, or curses can't initialize.
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            return curses.wrapper(_pick_path_curses, prompt, default)
-        except curses.error:
-            pass
-    return _ask_path_plain(prompt, default)
+    # Single prompt line with up to 8 suggestion lines below, redrawn on
+    # every keystroke - the inline replacement for the old alternate-screen dropdown.
+    # Falls back to the plain input()-based picker when there's no real
+    # terminal to draw into.
+    if not _interactive():
+        return _ask_path_plain(prompt, default)
 
+    width = shutil.get_terminal_size().columns
+    buffer = default or ""
+    highlighted = 0
+    error = None
+    path = None
+    frame = _Frame()
 
-def ask_choice(prompt, options):
-    print(paint(f"  {prompt}", C.BOLD))
-    for i, opt in enumerate(options, 1):
-        print(f"    {i}) {opt}")
-    while True:
-        raw = input(paint("  > ", C.BOLD)).strip()
-        if raw.isdigit() and 1 <= int(raw) <= len(options):
-            return options[int(raw) - 1]
-        print(dim(f"    enter a number 1-{len(options)}"))
+    with _raw_mode():
+        while True:
+            base, suggestions = _path_suggestions(buffer)
+            highlighted = max(0, min(highlighted, len(suggestions) - 1)) if suggestions else 0
+
+            lines = [
+                _fit_segments(
+                    [("◆ ", (C.CYAN,)), (f"{prompt} ", (C.BOLD,)), (buffer, None)], width
+                )
+            ]
+            if error:
+                lines.append(_fit_segments([(f"    {error}", (C.RED,))], width))
+                error = None
+            for i, suggestion in enumerate(suggestions[:8]):
+                text = f"    {suggestion}/"
+                if i == highlighted:
+                    lines.append(_fit_segments([(text, (C.CYAN, C.REVERSE))], width))
+                else:
+                    lines.append(_fit_segments([(text, (C.DIM,))], width))
+            lines.append(_fit_segments(
+                [("    type to filter · ↑↓ select · tab descend · enter confirm", (C.DIM,))],
+                width,
+            ))
+            frame.render(lines)
+
+            key = _read_key()
+            if key == "up" and suggestions:
+                highlighted = (highlighted - 1) % len(suggestions)
+            elif key == "down" and suggestions:
+                highlighted = (highlighted + 1) % len(suggestions)
+            elif key == "tab" and suggestions:
+                buffer = str(suggestions[highlighted]) + "/"
+                highlighted = 0
+            elif key == "enter":
+                candidate = buffer
+                expanded_candidate = os.path.expanduser(candidate)
+                if not os.path.isdir(expanded_candidate) and suggestions:
+                    candidate = str(suggestions[highlighted])
+                    expanded_candidate = candidate
+                candidate_path = Path(expanded_candidate).resolve()
+                if candidate_path.is_dir():
+                    path = candidate_path
+                    break
+                error = f"'{candidate}' isn't a directory, try again"
+            elif key == "backspace":
+                buffer = buffer[:-1]
+                highlighted = 0
+            elif key == "esc":
+                buffer = ""
+                highlighted = 0
+            elif len(key) == 1 and key.isprintable():
+                buffer += key
+                highlighted = 0
+
+    frame.collapse(_collapse_line("path", str(path)))
+    return str(path)
 
 
 # ------------------------------------------------------------- run helpers
-def wait_for_port(port, timeout=120, host="localhost"):
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def wait_for_port(port, timeout=120, host="localhost", label=None):
+    # label=None (or a non-tty stdout) keeps this exactly as silent/plain as
+    # before - callers print their own ok()/err() line once this returns.
+    # When a label is given on a real terminal, animate a one-line spinner in
+    # place (redrawn with \r\x1b[K) so waiting doesn't look like a hang; the
+    # line is cleared before returning either way so the caller's line lands
+    # clean.
+    animate = label is not None and sys.stdout.isatty()
     deadline = time.time() + timeout
+    start = time.time()
+    frame_i = 0
     while time.time() < deadline:
         try:
             with socket.create_connection((host, port), timeout=2):
+                if animate:
+                    sys.stdout.write("\r\x1b[K")
+                    sys.stdout.flush()
                 return True
         except OSError:
+            if animate:
+                elapsed = int(time.time() - start)
+                spinner = _SPINNER_FRAMES[frame_i % len(_SPINNER_FRAMES)]
+                frame_i += 1
+                text = f"{spinner} waiting for {label} on :{port} ({elapsed}s)"
+                sys.stdout.write("\r\x1b[K" + paint(text, C.DIM))
+                sys.stdout.flush()
             time.sleep(1)
+    if animate:
+        sys.stdout.write("\r\x1b[K")
+        sys.stdout.flush()
     return False
 
 
@@ -487,12 +734,12 @@ def register_one_service(project_slug, existing_names):
 
 
 def print_service_summary(services):
+    rows = []
     for i, svc in enumerate(services, 1):
-        extra = svc.get("compose_project") or svc.get("script") or svc.get("command", "")
-        port = f":{svc['port']}" if svc.get("port") else ""
-        runner = svc["runner"]
-        print(f"    {i}. {paint(svc['name'], C.BOLD)}{port} "
-              f"{dim(f'({runner} - {extra})')}")
+        extra = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
+        port = f":{svc['port']}" if svc.get("port") else "-"
+        rows.append([str(i), svc["name"], svc["runner"], port, extra])
+    print(render_table(["#", "service", "runner", "port", "detail"], rows))
 
 
 def _reorder_services(services):
@@ -598,19 +845,19 @@ def cmd_list(args):
         return
     for name, entry in sorted(registry.items()):
         heading(name)
+        rows = []
         for svc in entry["services"]:
             running = service_running(svc)
-            dot = paint("●", C.GREEN) if running else (
-                dim("○") if running is False else dim("○?")
-            )
-            extra = svc.get("compose_project") or svc.get("script") or svc.get("command", "")
-            runner = svc["runner"]
-            name_col = paint(f"{svc['name']:<20}", C.BOLD)
+            if running is True:
+                status = ("● running", C.GREEN)
+            elif running is False:
+                status = ("○ stopped", C.DIM)
+            else:
+                status = ("○ unknown", C.DIM)
+            extra = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
             port_text = f"localhost:{svc['port']}" if svc.get("port") else "no port"
-            port_col = f"{port_text:<22}"
-            if not svc.get("port"):
-                port_col = dim(port_col)
-            print(f"    {dot} {name_col} {port_col} {dim(f'{runner} - {extra}')}")
+            rows.append([svc["name"], svc["runner"], port_text, extra, status])
+        print(render_table(["service", "runner", "port", "detail", "status"], rows))
     print(dim(f"\n  logs: {DOZZLE_URL}"))
 
 
@@ -698,7 +945,7 @@ def run_tmux(name, entry):
         else:
             subprocess.run(["tmux", "split-window", "-t", session, cmd], check=True)
         if svc.get("port"):
-            if wait_for_port(svc["port"]):
+            if wait_for_port(svc["port"], label=svc["name"]):
                 ok(f"{svc['name']} is up on :{svc['port']}")
             else:
                 err(f"timed out waiting for {svc['name']} on :{svc['port']}")
@@ -771,7 +1018,7 @@ def run_terminator(name, entry):
     ])
     for svc in services:
         if svc.get("port"):
-            if wait_for_port(svc["port"]):
+            if wait_for_port(svc["port"], label=svc["name"]):
                 ok(f"{svc['name']} is up on :{svc['port']}")
             else:
                 err(f"timed out waiting for {svc['name']} on :{svc['port']}")
@@ -793,7 +1040,7 @@ def run_fallback(name, entry):
         subprocess.Popen(["bash", "-c", cmd], stdout=logf, stderr=subprocess.STDOUT)
         print(dim(f"    logging to {log_path}"))
         if svc.get("port"):
-            if wait_for_port(svc["port"]):
+            if wait_for_port(svc["port"], label=svc["name"]):
                 ok(f"{svc['name']} is up on :{svc['port']}")
             else:
                 err(f"timed out waiting for {svc['name']} on :{svc['port']}")
@@ -820,7 +1067,7 @@ def cmd_run(args):
     for svc in services:
         detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
         port = f"localhost:{svc['port']}" if svc.get("port") else "-"
-        status = ("running", C.GREEN) if service_running(svc) else ("stopped", C.DIM)
+        status = ("● running", C.GREEN) if service_running(svc) else ("○ stopped", C.DIM)
         rows.append([svc["name"], svc["runner"], port, detail, status])
     print(render_table(["service", "runner", "port", "detail", "status"], rows))
 
@@ -836,10 +1083,13 @@ def cmd_run(args):
         run_tmux(args.name, entry)
 
     heading(args.name)
-    url_rows = [[svc["name"], f"http://localhost:{svc['port']}" if svc.get("port") else "(no port)"]
-                for svc in services]
-    url_rows.append(["logs (all)", DOZZLE_URL])
-    print(render_table(["service", "url"], url_rows))
+    url_rows = []
+    for svc in services:
+        status = ("● running", C.GREEN) if service_running(svc) else ("○ stopped", C.DIM)
+        url = f"http://localhost:{svc['port']}" if svc.get("port") else "(no port)"
+        url_rows.append([svc["name"], status, url])
+    url_rows.append(["logs (all)", ("● running", C.GREEN), DOZZLE_URL])
+    print(render_table(["service", "status", "url"], url_rows))
 
     if backend == "tmux":
         session = tmux_session_name(args.name)
@@ -880,7 +1130,7 @@ def print_help():
     heading("COMMANDS")
     width = max(len(cmd) for cmd, _ in COMMANDS_HELP)
     for cmd, desc in COMMANDS_HELP:
-        cmd_col = paint(f"{cmd:<{width}}", C.BOLD)
+        cmd_col = paint(f"{cmd:<{width}}", C.BOLD, C.CYAN)
         print(f"  {cmd_col}  {dim(desc)}")
     heading("EXAMPLES")
     for line in ("devstack register lawial", "devstack run lawial", "devstack list"):
