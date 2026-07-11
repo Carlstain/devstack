@@ -62,11 +62,14 @@ else
   echo "  [ ] docker not found - devstack needs it for docker-compose services and the Dozzle log viewer"
 fi
 
-if command -v tmux >/dev/null 2>&1; then
-  echo "  [x] tmux found"
+if command -v terminator >/dev/null 2>&1; then
+  echo "  [x] terminator found (preferred for 'devstack run' - real split panes in its own window)"
+elif command -v tmux >/dev/null 2>&1; then
+  echo "  [x] tmux found ('devstack run' will use it - install terminator for nicer split panes)"
 else
-  echo "  [ ] tmux not found - 'devstack run' will fall back to sequential mode (no split panes)"
-  echo "      install with: sudo apt install tmux"
+  echo "  [ ] neither terminator nor tmux found - 'devstack run' will fall back to sequential mode (no split panes)"
+  echo "      recommended: sudo apt install terminator"
+  echo "      or at least: sudo apt install tmux"
 fi
 
 echo

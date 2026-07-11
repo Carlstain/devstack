@@ -9,11 +9,13 @@ whole thing from anywhere with one command:
 devstack run lawial
 ```
 
-Each service gets its own tmux pane (its actual live output — docker compose
+Each service gets its own split pane (its actual live output — docker compose
 logs, Vite/webpack output, whatever it prints), started in the order you
 registered them, each one waited on before the next starts if you gave it a
-port. A shared Dozzle container gives a web-based view of every project's
-docker logs regardless of which one is currently running.
+port. Panes open in [Terminator](https://gnome-terminator.org/) if it's
+installed, falling back to tmux, falling back to a plain sequential mode with
+no panes at all. A shared Dozzle container gives a web-based view of every
+project's docker logs regardless of which one is currently running.
 
 ## Install
 
@@ -23,8 +25,10 @@ git clone git@github.com:Carlstain/devstack.git ~/tools/devstack
 ```
 
 This symlinks `devstack` onto `~/.local/bin`, wires up shell completion (see
-below), and checks for `docker` (required) and `tmux` (optional — `run` falls
-back to a sequential, no-split-panes mode without it).
+below), and checks for `docker` (required) and `terminator`/`tmux` (optional —
+`terminator` is recommended for the nicest split panes; `tmux` is used if
+it's the only one found; `run` falls back to a sequential, no-split-panes
+mode if neither is installed).
 
 ## Shell completion
 
@@ -41,8 +45,8 @@ instead.
 devstack register <project>   # interactive: add services one at a time
 devstack edit <project>       # open the raw config in $EDITOR
 devstack list                 # show every registered project + live up/down status
-devstack run <project>        # boot it: one tmux pane per service, in order
-devstack down <project>       # tear down its docker-compose services, kill the tmux session
+devstack run <project>        # boot it: one pane per service, in order
+devstack down <project>       # tear down its docker-compose services, close the panes
 devstack infra up / down      # manage the shared Dozzle log viewer directly
 ```
 
@@ -50,15 +54,21 @@ devstack infra up / down      # manage the shared Dozzle log viewer directly
 
 For every service it asks:
 - **name** (e.g. `back`, `front`, `keycloak`)
-- **path** — must already exist
-- **how it's run** — `docker-compose`, `yarn`, `pnpm`, `npm`, `poetry`, or `custom`,
-  with follow-up questions specific to that choice (compose project name,
-  script name, the command to run, etc.)
+- **path** — a live, filterable dropdown of matching directories as you type
+  (arrow keys to move, Tab to descend, Enter to accept), falling back to a
+  plain prompt if your terminal can't do that
+- **how it's run** — `docker-compose`, `yarn`, `pnpm`, `npm`, `poetry`, or
+  `custom`. If the path has a `docker-compose.yml`/`package.json`/
+  `pyproject.toml`, that runner is floated to the top of the list; for Node
+  projects, `package.json`'s `scripts` are offered as a pick-list instead of
+  free text. Best-effort port detection pre-fills the port question too.
 - **port** to wait on before starting the next service (optional — leave blank
   for a service with nothing to poll, e.g. a background worker)
 
-Register in the order services should start. Run it again on an already-registered
-project to add more services, or start over from scratch.
+Register in the order services should start — if you add more than one,
+you're offered a chance to reorder them (boot order matters) before saving.
+Run it again on an already-registered project to add more services, or start
+over from scratch.
 
 ### Editing later
 
@@ -71,24 +81,27 @@ project.
 
 0. If another registered project already has something running (checked by
    port and, for docker-compose services, by whether its compose project has
-   containers up), it asks what to do: stop the other one first, keep it
-   running and start this one too, or cancel. Skipped entirely if nothing
-   else is running, and auto-continues (leaving the other one running) when
-   stdin isn't a terminal.
+   containers up), it shows a table of what's running and asks what to do:
+   stop the other one first, keep it running and start this one too, or
+   cancel. Skipped entirely if nothing else is running, and auto-continues
+   (leaving the other one running) when stdin isn't a terminal.
 1. Makes sure the shared Dozzle container is running
    (`infra/docker-compose.yml`, published at http://localhost:9999 — shows
    live logs for every container on the machine, grouped by compose project).
 2. Creates the project's shared docker network if it declared one.
-3. Opens (or reattaches to) a tmux session named `devstack-<project>`, adding
-   one pane per service in registration order:
+3. Prints a table of every service (runner, port, detail, current status)
+   before touching anything.
+4. Opens one pane per service in registration order — in a Terminator window
+   if it's installed, else a tmux session named `devstack-<project>`, else
+   sequentially in the background with output logged to files under the
+   system temp dir (the last service, if not `docker-compose`, then runs
+   directly in your terminal):
    - `docker-compose` services: `up -d --build` then `logs -f` in the same pane
    - everything else: the service's actual run command, directly, in the foreground
    - if the service has a port, `run` polls it before moving on to the next one
-4. Attaches you to that session if run from an interactive terminal.
-
-If `tmux` isn't installed, services start sequentially with output logged to
-files under the system temp dir instead of panes, and the last service (if
-it's not a `docker-compose` one) runs directly in your terminal.
+5. Prints a final table of each service's URL. Attaches you to the tmux
+   session if that's the backend and you're at an interactive terminal;
+   Terminator's window is already on screen, nothing further to do.
 
 ## Where things live
 

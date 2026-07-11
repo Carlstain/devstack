@@ -4,6 +4,7 @@
 See CLAUDE.md in this repo for the full design write-up.
 """
 import argparse
+import curses
 import json
 import os
 import re
@@ -68,6 +69,44 @@ def dim(text):
     return paint(text, C.DIM)
 
 
+def render_table(headers, rows):
+    # Cells are either a plain string, or a (text, *paint_codes) tuple for a
+    # colored cell. Width is always computed off the plain text so painted
+    # ANSI codes never throw off column alignment (see CLAUDE.md styling notes).
+    def cell_text(cell):
+        return cell[0] if isinstance(cell, tuple) else cell
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell_text(cell)))
+
+    def hline(left, mid, right):
+        return left + mid.join("─" * (w + 2) for w in widths) + right
+
+    def render_row(cells, bold=False):
+        parts = []
+        for i, cell in enumerate(cells):
+            padded = f"{cell_text(cell):<{widths[i]}}"
+            if bold:
+                parts.append(paint(padded, C.BOLD))
+            elif isinstance(cell, tuple):
+                parts.append(paint(padded, *cell[1:]))
+            else:
+                parts.append(padded)
+        return "│ " + " │ ".join(parts) + " │"
+
+    lines = [
+        "  " + hline("┌", "┬", "┐"),
+        "  " + render_row(headers, bold=True),
+        "  " + hline("├", "┼", "┤"),
+    ]
+    for row in rows:
+        lines.append("  " + render_row(row))
+    lines.append("  " + hline("└", "┴", "┘"))
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------- registry
 def load_registry():
     if not REGISTRY_PATH.exists():
@@ -106,8 +145,8 @@ def ask_int(prompt, default=None):
             print(dim("    not a number, try again"))
 
 
-def ask_optional_int(prompt):
-    raw = ask(prompt, default="")
+def ask_optional_int(prompt, default=None):
+    raw = ask(prompt, default=str(default) if default is not None else "")
     if not raw:
         return None
     try:
@@ -129,13 +168,113 @@ def ask_yes_no(prompt, default=True):
             return False
 
 
-def ask_path(prompt, default=None):
+def _ask_path_plain(prompt, default=None):
     while True:
         raw = ask(prompt, default=default, required=True)
         path = Path(raw).expanduser().resolve()
         if path.is_dir():
             return str(path)
         print(dim(f"    '{path}' isn't a directory, try again"))
+
+
+def _path_suggestions(buffer, limit=10):
+    expanded = os.path.expanduser(buffer) if buffer else str(Path.cwd())
+    if not buffer or buffer.endswith("/"):
+        base, prefix = expanded, ""
+    else:
+        base, prefix = os.path.split(expanded)
+        base = base or "."
+    try:
+        entries = sorted(
+            p for p in Path(base).iterdir()
+            if p.is_dir()
+            and p.name.startswith(prefix)
+            and (prefix.startswith(".") or not p.name.startswith("."))
+        )
+    except OSError:
+        entries = []
+    return base, entries[:limit]
+
+
+def _safe_addstr(stdscr, y, x, text, attr=0):
+    maxy, maxx = stdscr.getmaxyx()
+    if y < 0 or y >= maxy or x < 0 or x >= maxx:
+        return
+    stdscr.addstr(y, x, text[: max(0, maxx - x - 1)], attr)
+
+
+def _pick_path_curses(stdscr, prompt, default):
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    stdscr.keypad(True)
+    buffer = default or ""
+    selected = 0
+    error = ""
+
+    while True:
+        base, suggestions = _path_suggestions(buffer)
+        selected = max(0, min(selected, len(suggestions) - 1)) if suggestions else 0
+
+        stdscr.erase()
+        maxy, _ = stdscr.getmaxyx()
+        _safe_addstr(stdscr, 0, 0, f"{prompt}: {buffer}", curses.A_BOLD)
+        row = 2
+        if error:
+            _safe_addstr(stdscr, row, 2, error)
+            row += 2
+        for i, s in enumerate(suggestions):
+            if row + i >= maxy - 2:
+                break
+            attr = curses.A_REVERSE if i == selected else 0
+            _safe_addstr(stdscr, row + i, 2, str(s) + "/", attr)
+        _safe_addstr(
+            stdscr, maxy - 1, 0,
+            "up/down move  tab descend  enter select  ctrl-c cancel",
+        )
+        stdscr.refresh()
+        error = ""
+
+        key = stdscr.getch()
+        if key == curses.KEY_UP and suggestions:
+            selected = (selected - 1) % len(suggestions)
+        elif key == curses.KEY_DOWN and suggestions:
+            selected = (selected + 1) % len(suggestions)
+        elif key in (9, curses.KEY_RIGHT) and suggestions:
+            buffer = str(suggestions[selected]) + "/"
+            selected = 0
+        elif key in (10, 13, curses.KEY_ENTER):
+            candidate = buffer
+            expanded_candidate = os.path.expanduser(candidate)
+            if not os.path.isdir(expanded_candidate) and suggestions:
+                candidate = str(suggestions[selected])
+                expanded_candidate = candidate
+            path = Path(expanded_candidate).resolve()
+            if path.is_dir():
+                return str(path)
+            error = f"'{candidate}' isn't a directory, try again"
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            buffer = buffer[:-1]
+            selected = 0
+        elif key == 27:  # Esc - clear and start over
+            buffer = ""
+            selected = 0
+        elif 32 <= key <= 126:
+            buffer += chr(key)
+            selected = 0
+
+
+def ask_path(prompt, default=None):
+    # Live dropdown of matching subdirectories, closer to an '@'-mention
+    # picker than plain tab completion. Falls back to plain input() when
+    # there's no real terminal to draw into, or curses can't initialize.
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            return curses.wrapper(_pick_path_curses, prompt, default)
+        except curses.error:
+            pass
+    return _ask_path_plain(prompt, default)
 
 
 def ask_choice(prompt, options):
@@ -247,14 +386,68 @@ def cmd_infra_down(args):
 
 
 # ---------------------------------------------------------------- register
-def configure_runner(runner):
+COMPOSE_FILENAMES = ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+
+
+def _detect_runner(path):
+    p = Path(path)
+    if any((p / f).exists() for f in COMPOSE_FILENAMES):
+        return "docker-compose"
+    if (p / "package.json").exists():
+        if (p / "pnpm-lock.yaml").exists():
+            return "pnpm"
+        if (p / "yarn.lock").exists():
+            return "yarn"
+        return "npm"
+    if (p / "pyproject.toml").exists():
+        return "poetry"
+    return None
+
+
+def _package_json_scripts(path):
+    pkg = Path(path) / "package.json"
+    if not pkg.exists():
+        return {}
+    try:
+        data = json.loads(pkg.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    scripts = data.get("scripts")
+    return scripts if isinstance(scripts, dict) else {}
+
+
+def _detect_port(path):
+    p = Path(path)
+    for fname in COMPOSE_FILENAMES:
+        compose = p / fname
+        if compose.exists():
+            match = re.search(r'-\s*"?(\d{2,5}):\d{2,5}"?', compose.read_text())
+            if match:
+                return int(match.group(1))
+            break
+    pkg = p / "package.json"
+    if pkg.exists():
+        match = re.search(r'"PORT"\s*:\s*"?(\d{2,5})', pkg.read_text())
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def configure_runner(runner, path):
     if runner == "docker-compose":
         return {
             "compose_project": ask("compose project name (-p)", required=True),
             "build": ask_yes_no("build image before starting?", default=True),
         }
     if runner in ("yarn", "pnpm", "npm"):
-        return {"script": ask("script to run", default="dev")}
+        scripts = _package_json_scripts(path)
+        if scripts:
+            default_script = "dev" if "dev" in scripts else next(iter(scripts))
+            options = [default_script] + [s for s in scripts if s != default_script]
+            script = ask_choice(f"script to run ({runner} run <script>)", options)
+        else:
+            script = ask("script to run", default="dev")
+        return {"script": script}
     if runner == "poetry":
         return {"command": ask("command to run after 'poetry run'", required=True)}
     if runner == "custom":
@@ -270,10 +463,22 @@ def register_one_service(project_slug, existing_names):
             break
         print(dim(f"    '{name}' is already used in this project, pick another"))
     path = ask_path("path (directory)")
-    runner = ask_choice("how is it run?", RUNNERS)
-    extra = configure_runner(runner)
-    default_port = None
-    port = ask_optional_int("port to wait on before starting the next service (blank = none)")
+
+    detected = _detect_runner(path)
+    runner_options = RUNNERS
+    if detected and detected in RUNNERS:
+        runner_options = [detected] + [r for r in RUNNERS if r != detected]
+        print(dim(f"    detected: {detected} (based on files in {path})"))
+    runner = ask_choice("how is it run?", runner_options)
+    extra = configure_runner(runner, path)
+
+    default_port = _detect_port(path)
+    if default_port:
+        print(dim(f"    detected port: {default_port}"))
+    port = ask_optional_int(
+        "port to wait on before starting the next service (blank = none)",
+        default=default_port,
+    )
     svc = {"name": name, "path": path, "runner": runner, "port": port}
     svc.update(extra)
     if runner == "docker-compose" and not svc.get("compose_project"):
@@ -288,6 +493,25 @@ def print_service_summary(services):
         runner = svc["runner"]
         print(f"    {i}. {paint(svc['name'], C.BOLD)}{port} "
               f"{dim(f'({runner} - {extra})')}")
+
+
+def _reorder_services(services):
+    n = len(services)
+    example = ",".join(str(i) for i in range(n, 0, -1))
+    while True:
+        raw = ask(f"new order, comma-separated 1-{n} (e.g. {example})", required=True)
+        try:
+            order = [int(x.strip()) for x in raw.split(",")]
+        except ValueError:
+            print(dim("    not a list of numbers, try again"))
+            continue
+        if sorted(order) != list(range(1, n + 1)):
+            print(dim(f"    must be a permutation of 1-{n}, try again"))
+            continue
+        reordered = [services[i - 1] for i in order]
+        heading("New order")
+        print_service_summary(reordered)
+        return reordered
 
 
 def cmd_register(args):
@@ -327,6 +551,9 @@ def cmd_register(args):
     if not services:
         warn("no services added, nothing saved")
         return
+
+    if len(services) > 1 and ask_yes_no("reorder services? (boot order matters)", default=False):
+        services = _reorder_services(services)
 
     heading(f"Final config for '{args.name}'")
     print_service_summary(services)
@@ -406,9 +633,16 @@ def running_projects(registry, exclude=None):
 
 
 def teardown_project(name, entry):
+    heading(f"Stopping '{name}'")
+    rows = []
+    for svc in entry["services"]:
+        detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
+        rows.append([svc["name"], svc["runner"], detail])
+    print(render_table(["service", "runner", "detail"], rows))
+
     for svc in reversed(entry["services"]):
         if svc["runner"] == "docker-compose":
-            heading(f"Stopping {svc['name']}")
+            print(f"  stopping {paint(svc['name'], C.BOLD)}...")
             subprocess.run(["docker", "compose", "-p", svc["compose_project"], "down"])
 
     session = tmux_session_name(name)
@@ -423,8 +657,12 @@ def check_other_running(registry, name):
         return
 
     heading("Another project looks like it's already running")
+    rows = []
     for o in others:
-        warn(o)
+        live = [s["name"] for s in registry[o]["services"] if service_running(s)]
+        status = (", ".join(live), C.GREEN) if live else ("(docker only)", C.DIM)
+        rows.append([o, status])
+    print(render_table(["project", "running services"], rows))
 
     if not sys.stdin.isatty():
         warn("non-interactive - leaving it running and continuing")
@@ -443,8 +681,104 @@ def check_other_running(registry, name):
             teardown_project(o, registry[o])
 
 
+def run_tmux(name, entry):
+    services = entry["services"]
+    session = tmux_session_name(name)
+    if tmux_has_session(session):
+        ok(f"session '{session}' already running")
+        return
+    for i, svc in enumerate(services):
+        cmd = build_pane_command(svc)
+        heading(f"Starting {svc['name']}")
+        if i == 0:
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", session, "-n", "main", cmd],
+                check=True,
+            )
+        else:
+            subprocess.run(["tmux", "split-window", "-t", session, cmd], check=True)
+        if svc.get("port"):
+            if wait_for_port(svc["port"]):
+                ok(f"{svc['name']} is up on :{svc['port']}")
+            else:
+                err(f"timed out waiting for {svc['name']} on :{svc['port']}")
+    subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
+
+
+def _configobj_value(value):
+    # ConfigObj (terminator's config format) needs triple-quoting for values
+    # with spaces/quotes/#, or that are empty - everything else can be bare.
+    value = str(value)
+    if value == "" or re.search(r'''[\s"'#]''', value):
+        return f"'''{value}'''"
+    return value
+
+
+def _terminator_layout(services):
+    # Nested HPaned chain -> N terminals side by side, one per service, in
+    # boot order left-to-right. Schema reverse-engineered from the installed
+    # terminatorlib source (config.py DEFAULTS['layouts'], terminal.py
+    # describe_layout/create_layout, paned.py create_layout) since it isn't
+    # documented: a Paned widget (HPaned/VPaned) always has exactly 2
+    # children, distinguished by their own 'order' field (0 = left/top,
+    # 1 = right/bottom) relative to that shared parent.
+    layout = {"window0": {"type": "Window", "parent": ""}}
+    if len(services) == 1:
+        layout["terminal0"] = {
+            "type": "Terminal", "parent": "window0", "order": 0,
+            "profile": "default", "command": build_pane_command(services[0]),
+        }
+        return layout
+
+    parent = "window0"
+    for i, svc in enumerate(services[:-1]):
+        pane_id = f"hpaned{i}"
+        layout[pane_id] = {"type": "HPaned", "parent": parent, "order": 1}
+        layout[f"terminal{i}"] = {
+            "type": "Terminal", "parent": pane_id, "order": 0,
+            "profile": "default", "command": build_pane_command(svc),
+        }
+        parent = pane_id
+    layout[f"terminal{len(services) - 1}"] = {
+        "type": "Terminal", "parent": parent, "order": 1,
+        "profile": "default", "command": build_pane_command(services[-1]),
+    }
+    return layout
+
+
+def run_terminator(name, entry):
+    services = entry["services"]
+    if services and all(service_running(s) for s in services):
+        ok(f"'{name}' looks like it's already running")
+        return
+
+    layout_name = f"devstack-{name}"
+    layout = _terminator_layout(services)
+    lines = ["[profiles]", "[[default]]", "[layouts]", f"[[{layout_name}]]"]
+    for obj_id, fields in layout.items():
+        lines.append(f"[[[{obj_id}]]]")
+        for key, value in fields.items():
+            lines.append(f"{key} = {_configobj_value(value)}")
+
+    with tempfile.NamedTemporaryFile("w", suffix=".config", delete=False) as tf:
+        tf.write("\n".join(lines) + "\n")
+        config_path = tf.name
+
+    heading(f"Starting {name} (terminator)")
+    subprocess.Popen([
+        "terminator", "-u", "-g", config_path, "-l", layout_name,
+        "-T", f"devstack: {name}",
+    ])
+    for svc in services:
+        if svc.get("port"):
+            if wait_for_port(svc["port"]):
+                ok(f"{svc['name']} is up on :{svc['port']}")
+            else:
+                err(f"timed out waiting for {svc['name']} on :{svc['port']}")
+
+
 def run_fallback(name, entry):
-    warn("tmux not found - running services sequentially, no split panes.")
+    warn("neither terminator nor tmux found - running services sequentially, no split panes.")
     services = entry["services"]
     for i, svc in enumerate(services):
         is_last = i == len(services) - 1
@@ -481,44 +815,41 @@ def cmd_run(args):
 
     services = entry["services"]
 
-    if shutil.which("tmux") is None:
+    heading(f"Starting '{args.name}'")
+    rows = []
+    for svc in services:
+        detail = svc.get("compose_project") or svc.get("script") or svc.get("command", "") or "-"
+        port = f"localhost:{svc['port']}" if svc.get("port") else "-"
+        status = ("running", C.GREEN) if service_running(svc) else ("stopped", C.DIM)
+        rows.append([svc["name"], svc["runner"], port, detail, status])
+    print(render_table(["service", "runner", "port", "detail", "status"], rows))
+
+    backend = "terminator" if shutil.which("terminator") else (
+        "tmux" if shutil.which("tmux") else None
+    )
+    if backend is None:
         run_fallback(args.name, entry)
         return
-
-    session = tmux_session_name(args.name)
-    if tmux_has_session(session):
-        ok(f"session '{session}' already running")
+    if backend == "terminator":
+        run_terminator(args.name, entry)
     else:
-        for i, svc in enumerate(services):
-            cmd = build_pane_command(svc)
-            heading(f"Starting {svc['name']}")
-            if i == 0:
-                subprocess.run(
-                    ["tmux", "new-session", "-d", "-s", session, "-n", "main", cmd],
-                    check=True,
-                )
-            else:
-                subprocess.run(["tmux", "split-window", "-t", session, cmd], check=True)
-            if svc.get("port"):
-                if wait_for_port(svc["port"]):
-                    ok(f"{svc['name']} is up on :{svc['port']}")
-                else:
-                    err(f"timed out waiting for {svc['name']} on :{svc['port']}")
-        subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
+        run_tmux(args.name, entry)
 
     heading(args.name)
-    for svc in services:
-        port = f"http://localhost:{svc['port']}" if svc.get("port") else "(no port)"
-        name_col = paint(f"{svc['name']:<14}", C.BOLD)
-        print(f"  {name_col} {port}")
-    logs_col = paint(f"{'logs (all)':<14}", C.BOLD)
-    print(f"  {logs_col} {DOZZLE_URL}")
-    print(f"\ntmux session: {session}")
+    url_rows = [[svc["name"], f"http://localhost:{svc['port']}" if svc.get("port") else "(no port)"]
+                for svc in services]
+    url_rows.append(["logs (all)", DOZZLE_URL])
+    print(render_table(["service", "url"], url_rows))
 
-    if sys.stdout.isatty():
-        os.execvp("tmux", ["tmux", "attach", "-t", session])
+    if backend == "tmux":
+        session = tmux_session_name(args.name)
+        print(f"\ntmux session: {session}")
+        if sys.stdout.isatty():
+            os.execvp("tmux", ["tmux", "attach", "-t", session])
+        else:
+            print(f"Attach with: tmux attach -t {session}")
     else:
-        print(f"Attach with: tmux attach -t {session}")
+        print(f"\nterminator window: devstack: {args.name}")
 
 
 def cmd_down(args):
