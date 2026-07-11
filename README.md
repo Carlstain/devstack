@@ -1,4 +1,4 @@
-# devstack
+# SSpinner
 
 Global launcher for multi-repo local dev stacks. You register a project once
 — its services, where they live, and how each one is run (`docker compose`,
@@ -6,7 +6,7 @@ Global launcher for multi-repo local dev stacks. You register a project once
 whole thing from anywhere with one command:
 
 ```bash
-devstack run lawial
+sspinner run lawial
 ```
 
 Each service gets its own split pane (its actual live output — docker compose
@@ -20,11 +20,11 @@ project's docker logs regardless of which one is currently running.
 ## Install
 
 ```bash
-git clone git@github.com:Carlstain/devstack.git ~/tools/devstack
-~/tools/devstack/install.sh
+git clone git@github.com:Carlstain/sspinner.git ~/tools/sspinner
+~/tools/sspinner/install.sh
 ```
 
-This symlinks `devstack` onto `~/.local/bin`, wires up shell completion (see
+This symlinks `sspinner` onto `~/.local/bin`, wires up shell completion (see
 below), and checks for `docker` (required) and `terminator`/`tmux` (optional —
 `terminator` is recommended for the nicest split panes; `tmux` is used if
 it's the only one found; `run` falls back to a sequential, no-split-panes
@@ -33,36 +33,36 @@ mode if neither is installed).
 ## Shell completion
 
 `install.sh` adds a sourcing line to `~/.bashrc` and/or `~/.zshrc` (whichever
-exist) — open a new shell afterward and `devstack <TAB>` completes
-subcommands, `devstack run <TAB>` completes registered project names (pulled
-live from the registry), and `devstack infra <TAB>` completes `up`/`down`.
+exist) — open a new shell afterward and `sspinner <TAB>` completes
+subcommands, `sspinner run <TAB>` completes registered project names (pulled
+live from the registry), and `sspinner infra <TAB>` completes `up`/`down`.
 The scripts live in `completions/` if you want to source them manually
 instead.
 
 ## Commands
 
 ```bash
-devstack register <project>   # interactive: add services one at a time
-devstack edit <project>       # open the raw config in $EDITOR
-devstack list                 # show every registered project + live up/down status
-devstack run <project>        # boot it: one pane per service, in order
-devstack run <project> -b     # boot it in the background: no window, no attach
-devstack stop <project>       # tear down its docker-compose services, close the panes
-devstack infra up / down      # manage the shared Dozzle log viewer directly
+sspinner register <project>   # interactive: add services one at a time
+sspinner edit <project>       # open the raw config in $EDITOR
+sspinner list                 # show every registered project + live up/down status
+sspinner run <project>        # boot it: one pane per service, in order
+sspinner run <project> -b     # boot it in the background: no window, no attach
+sspinner stop <project>       # tear down its docker-compose services, close the panes
+sspinner infra up / down      # manage the shared Dozzle log viewer directly
 ```
 
-(`devstack down <project>` still works as a deprecated alias for `stop`.)
+(`sspinner down <project>` still works as a deprecated alias for `stop`.)
 
 ### `run -b` boots without taking over your terminal
 
 `-b`/`--background` skips Terminator entirely (no GUI window) and boots the
 stack in a detached tmux session instead — same live status table while it
 boots, but at the end you're returned straight to your shell with an
-`attach with: tmux attach -t devstack-<project>` pointer instead of being
-attached. `devstack stop` tears the whole thing down, background or not —
+`attach with: tmux attach -t sspinner-<project>` pointer instead of being
+attached. `sspinner stop` tears the whole thing down, background or not —
 updating the same kind of in-place live status table on the way down.
 Without tmux installed, `-b` falls back to running every service in the
-background with output logged to temp files — but devstack keeps no pid
+background with output logged to temp files — but sspinner keeps no pid
 file, so `stop` can only tear down the docker-compose services of a
 tmux-less background run; install tmux for reliable background teardown.
 
@@ -93,9 +93,9 @@ over from scratch.
 
 ### Editing later
 
-`devstack edit <project>` opens just that project's config (not the whole
+`sspinner edit <project>` opens just that project's config (not the whole
 registry) as JSON in `$EDITOR` and validates it on save. You can also edit
-`~/.config/devstack/registry.json` directly — it's plain JSON, one entry per
+`~/.config/sspinner/registry.json` directly — it's plain JSON, one entry per
 project.
 
 ## What `run` actually does
@@ -123,7 +123,7 @@ project.
    each service finishes, then the table prints once more at the end.
 4. Opens one pane per service in registration order — in a Terminator window
    if it's installed (an even grid, at most 2 terminals per row), else a
-   tmux session named `devstack-<project>`, else sequentially in the
+   tmux session named `sspinner-<project>`, else sequentially in the
    background with output logged to files under the system temp dir (the
    last service, if not `docker-compose`, then runs directly in your
    terminal):
@@ -136,8 +136,8 @@ project.
 
 ## Where things live
 
-- **Code** (this repo): `~/tools/devstack` (or wherever you clone it).
-- **Runtime state** (not in git): `~/.config/devstack/registry.json` — the
+- **Code** (this repo): `~/tools/sspinner` (or wherever you clone it).
+- **Runtime state** (not in git): `~/.config/sspinner/registry.json` — the
   project → services config that every command reads/writes.
 
 See `CLAUDE.md` for the internals if you're editing this tool with Claude Code.

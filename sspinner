@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""devstack — global, config-driven launcher for multi-repo dev stacks.
+"""sspinner — global, config-driven launcher for multi-repo dev stacks.
 
 See CLAUDE.md in this repo for the full design write-up.
 """
@@ -22,10 +22,13 @@ from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent
 INFRA_COMPOSE = REPO_DIR / "infra" / "docker-compose.yml"
-INFRA_PROJECT = "devstack-infra"
+INFRA_PROJECT = "sspinner-infra"
 DOZZLE_URL = "http://localhost:9999"
 
-REGISTRY_PATH = Path.home() / ".config" / "devstack" / "registry.json"
+REGISTRY_PATH = Path.home() / ".config" / "sspinner" / "registry.json"
+# Pre-rename location (the tool used to be called devstack) - read once and
+# migrated by load_registry() if the new path doesn't exist yet.
+LEGACY_REGISTRY_PATH = Path.home() / ".config" / "devstack" / "registry.json"
 
 RUNNERS = ["docker-compose", "yarn", "pnpm", "npm", "poetry", "custom"]
 
@@ -130,6 +133,13 @@ def render_table(headers, rows):
 
 # --------------------------------------------------------------- registry
 def load_registry():
+    if not REGISTRY_PATH.exists() and LEGACY_REGISTRY_PATH.exists():
+        # One-time migration from the tool's pre-rename config dir. Move, not
+        # copy: two live copies would silently diverge the moment either tool
+        # name is used to save.
+        REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(LEGACY_REGISTRY_PATH), str(REGISTRY_PATH))
+        ok(f"migrated registry from {LEGACY_REGISTRY_PATH} to {REGISTRY_PATH}")
     if not REGISTRY_PATH.exists():
         return {}
     return json.loads(REGISTRY_PATH.read_text())
@@ -797,7 +807,7 @@ def ensure_network(name):
 
 
 def tmux_session_name(project):
-    return f"devstack-{project}"
+    return f"sspinner-{project}"
 
 
 def tmux_has_session(session):
@@ -808,6 +818,14 @@ def tmux_has_session(session):
 
 # ------------------------------------------------------------------- infra
 def infra_up():
+    # One-time migration from the tool's pre-rename compose project: the old
+    # devstack-infra Dozzle holds port 9999 and the container name, so it has
+    # to come down before the sspinner-infra one can start.
+    if compose_has_containers("devstack-infra"):
+        subprocess.run(
+            ["docker", "compose", "-p", "devstack-infra", "-f", str(INFRA_COMPOSE), "down"],
+            capture_output=True,
+        )
     subprocess.run(
         ["docker", "compose", "-p", INFRA_PROJECT, "-f", str(INFRA_COMPOSE), "up", "-d"],
         check=True, capture_output=True,
@@ -816,7 +834,7 @@ def infra_up():
 
 def cmd_infra_up(args):
     infra_up()
-    ok(f"devstack infra is up. Logs: {DOZZLE_URL}")
+    ok(f"sspinner infra is up. Logs: {DOZZLE_URL}")
 
 
 def cmd_infra_down(args):
@@ -1037,7 +1055,7 @@ def cmd_edit(args):
     registry = load_registry()
     entry = registry.get(args.name)
     if entry is None:
-        err(f"'{args.name}' isn't registered. Run 'devstack list' to see what is.")
+        err(f"'{args.name}' isn't registered. Run 'sspinner list' to see what is.")
         sys.exit(1)
     editor = shlex.split(os.environ.get("EDITOR", "nano"))
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
@@ -1061,7 +1079,7 @@ def cmd_edit(args):
 def cmd_list(args):
     registry = load_registry()
     if not registry:
-        print("No projects registered yet. Run 'devstack register <name>'.")
+        print("No projects registered yet. Run 'sspinner register <name>'.")
         return
     for name, entry in sorted(registry.items()):
         heading(name)
@@ -1341,7 +1359,7 @@ def run_terminator(name, entry, table, animate):
             ok(f"'{name}' looks like it's already running")
         return
 
-    layout_name = f"devstack-{name}"
+    layout_name = f"sspinner-{name}"
     layout = _terminator_layout(services)
     lines = ["[profiles]", "[[default]]", "[layouts]", f"[[{layout_name}]]"]
     for obj_id, fields in layout.items():
@@ -1355,7 +1373,7 @@ def run_terminator(name, entry, table, animate):
 
     subprocess.Popen([
         "terminator", "-u", "-g", config_path, "-l", layout_name,
-        "-T", f"devstack: {name}",
+        "-T", f"sspinner: {name}",
     ])
 
     total = len(services)
@@ -1388,7 +1406,7 @@ def run_fallback(name, entry, background=False):
     # background=True (run -b when tmux isn't available either) skips the
     # exec-last-service-into-the-foreground special case below - every
     # service gets the same Popen+logfile treatment and control returns to
-    # the shell. Those Popen'd processes are fire-and-forget: devstack keeps
+    # the shell. Those Popen'd processes are fire-and-forget: sspinner keeps
     # no pid file, so `stop` can't kill non-docker services started this way
     # (see CLAUDE.md's "run control flow" for the honest limitation note).
     warn("neither terminator nor tmux found - running services sequentially, no split panes.")
@@ -1401,7 +1419,7 @@ def run_fallback(name, entry, background=False):
             print(dim(f"    {cmd}"))
             os.execvp("bash", ["bash", "-c", cmd])
             return  # unreachable
-        log_path = Path(tempfile.gettempdir()) / f"devstack-{name}-{svc['name']}.log"
+        log_path = Path(tempfile.gettempdir()) / f"sspinner-{name}-{svc['name']}.log"
         logf = open(log_path, "w")
         subprocess.Popen(["bash", "-c", cmd], stdout=logf, stderr=subprocess.STDOUT)
         print(dim(f"    logging to {log_path}"))
@@ -1417,7 +1435,7 @@ def cmd_run(args):
     registry = load_registry()
     entry = registry.get(args.name)
     if entry is None:
-        err(f"'{args.name}' isn't registered. Run 'devstack register {args.name}' first.")
+        err(f"'{args.name}' isn't registered. Run 'sspinner register {args.name}' first.")
         sys.exit(1)
 
     check_other_running(registry, args.name)
@@ -1475,7 +1493,7 @@ def cmd_run(args):
         else:
             pointer = f"tmux session: {session}"
     else:
-        pointer = f"terminator window: devstack: {args.name}"
+        pointer = f"terminator window: sspinner: {args.name}"
 
     if animate:
         table.set_context(dim(pointer), animate=True)
@@ -1496,7 +1514,7 @@ def cmd_stop(args):
     registry = load_registry()
     entry = registry.get(args.name)
     if entry is None:
-        err(f"'{args.name}' isn't registered. Run 'devstack list' to see what is.")
+        err(f"'{args.name}' isn't registered. Run 'sspinner list' to see what is.")
         sys.exit(1)
 
     teardown_project(args.name, entry)
@@ -1522,10 +1540,10 @@ COMMANDS_HELP = [
 
 
 def print_help():
-    print(paint("devstack", C.BOLD, C.CYAN) +
+    print(paint("sspinner", C.BOLD, C.CYAN) +
           " — global launcher for multi-repo dev stacks")
     heading("USAGE")
-    print("  devstack <command> [args]")
+    print("  sspinner <command> [args]")
     heading("COMMANDS")
     width = max(len(cmd) for cmd, _ in COMMANDS_HELP)
     for cmd, desc in COMMANDS_HELP:
@@ -1533,11 +1551,11 @@ def print_help():
         print(f"  {cmd_col}  {dim(desc)}")
     heading("EXAMPLES")
     examples = (
-        "devstack register lawial",
-        "devstack run lawial",
-        "devstack run lawial -b   # background: no window, no attach",
-        "devstack stop lawial",
-        "devstack list",
+        "sspinner register lawial",
+        "sspinner run lawial",
+        "sspinner run lawial -b   # background: no window, no attach",
+        "sspinner stop lawial",
+        "sspinner list",
     )
     for line in examples:
         print(dim(f"  {line}"))
@@ -1545,7 +1563,7 @@ def print_help():
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="devstack", description=__doc__)
+    parser = argparse.ArgumentParser(prog="sspinner", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("register", help="interactively define a project's services")

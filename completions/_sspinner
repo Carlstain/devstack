@@ -1,7 +1,7 @@
-#compdef devstack
-# zsh completion for devstack - autoloaded via fpath by install.sh
+#compdef sspinner
+# zsh completion for sspinner - autoloaded via fpath by install.sh
 
-_devstack() {
+_sspinner() {
     local -a commands
     commands=(
         'register:interactively define a project'"'"'s services'
@@ -22,7 +22,7 @@ _devstack() {
         register|edit|run|stop|down)
             if (( CURRENT == 3 )); then
                 local -a names
-                names=(${(f)"$(devstack _names 2>/dev/null)"})
+                names=(${(f)"$(sspinner _names 2>/dev/null)"})
                 _describe 'project' names
             fi
             ;;
@@ -36,4 +36,4 @@ _devstack() {
     esac
 }
 
-_devstack
+_sspinner

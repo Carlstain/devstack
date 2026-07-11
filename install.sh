@@ -1,14 +1,32 @@
 #!/usr/bin/env bash
-# Installs devstack: symlinks the CLI onto $PATH and checks for its runtime deps.
+# Installs sspinner: symlinks the CLI onto $PATH and checks for its runtime deps.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 
-chmod +x "$REPO_DIR/devstack"
+chmod +x "$REPO_DIR/sspinner"
 mkdir -p "$BIN_DIR"
-ln -sf "$REPO_DIR/devstack" "$BIN_DIR/devstack"
-echo "devstack -> $BIN_DIR/devstack (symlinked from $REPO_DIR)"
+ln -sf "$REPO_DIR/sspinner" "$BIN_DIR/sspinner"
+echo "sspinner -> $BIN_DIR/sspinner (symlinked from $REPO_DIR)"
+
+# One-time cleanup from the tool's pre-rename life as 'devstack': drop the
+# stale symlink (it points at a file that no longer exists in this repo) and
+# strip the old completion blocks from the shell rc files. The registry and
+# Dozzle container migrate themselves on first run - see load_registry() and
+# infra_up() in the sspinner script.
+if [ -L "$BIN_DIR/devstack" ] && [ ! -e "$BIN_DIR/devstack" ]; then
+  rm "$BIN_DIR/devstack"
+  echo "removed stale devstack symlink from $BIN_DIR"
+fi
+if [ -f "$HOME/.bashrc" ] && grep -qF "# devstack completion" "$HOME/.bashrc"; then
+  sed -i '/^# devstack completion$/,+1d' "$HOME/.bashrc"
+  echo "removed old devstack completion block from ~/.bashrc"
+fi
+if [ -f "$HOME/.zshrc" ] && grep -qF "# devstack completion" "$HOME/.zshrc"; then
+  sed -i '/^# devstack completion$/,+2d' "$HOME/.zshrc"
+  echo "removed old devstack completion block from ~/.zshrc"
+fi
 
 case ":$PATH:" in
   *":$BIN_DIR:"*)
@@ -24,14 +42,14 @@ esac
 echo
 echo "Shell completion:"
 
-MARKER="# devstack completion"
+MARKER="# sspinner completion"
 
 if [ -f "$HOME/.bashrc" ]; then
   if ! grep -qF "$MARKER" "$HOME/.bashrc"; then
     {
       echo ""
       echo "$MARKER"
-      echo "[ -f \"$REPO_DIR/completions/devstack.bash\" ] && source \"$REPO_DIR/completions/devstack.bash\""
+      echo "[ -f \"$REPO_DIR/completions/sspinner.bash\" ] && source \"$REPO_DIR/completions/sspinner.bash\""
     } >> "$HOME/.bashrc"
     echo "  added to ~/.bashrc (open a new shell, or: source ~/.bashrc)"
   else
@@ -59,19 +77,19 @@ echo "Checking dependencies:"
 if command -v docker >/dev/null 2>&1; then
   echo "  [x] docker found"
 else
-  echo "  [ ] docker not found - devstack needs it for docker-compose services and the Dozzle log viewer"
+  echo "  [ ] docker not found - sspinner needs it for docker-compose services and the Dozzle log viewer"
 fi
 
 if command -v terminator >/dev/null 2>&1; then
-  echo "  [x] terminator found (preferred for 'devstack run' - real split panes in its own window)"
+  echo "  [x] terminator found (preferred for 'sspinner run' - real split panes in its own window)"
 elif command -v tmux >/dev/null 2>&1; then
-  echo "  [x] tmux found ('devstack run' will use it - install terminator for nicer split panes)"
+  echo "  [x] tmux found ('sspinner run' will use it - install terminator for nicer split panes)"
 else
-  echo "  [ ] neither terminator nor tmux found - 'devstack run' will fall back to sequential mode (no split panes)"
+  echo "  [ ] neither terminator nor tmux found - 'sspinner run' will fall back to sequential mode (no split panes)"
   echo "      recommended: sudo apt install terminator"
   echo "      or at least: sudo apt install tmux"
 fi
 
 echo
-echo "Try: devstack --help"
-echo "Then: devstack register <project>"
+echo "Try: sspinner --help"
+echo "Then: sspinner register <project>"
