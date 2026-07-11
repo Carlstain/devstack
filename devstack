@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""devstack — global, config-driven launcher for multi-repo dev stacks.
+
+See CLAUDE.md in this repo for the full design write-up.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent
+INFRA_COMPOSE = REPO_DIR / "infra" / "docker-compose.yml"
+INFRA_PROJECT = "devstack-infra"
+DOZZLE_URL = "http://localhost:9999"
+
+REGISTRY_PATH = Path.home() / ".config" / "devstack" / "registry.json"
+
+RUNNERS = ["docker-compose", "yarn", "pnpm", "npm", "poetry", "custom"]
+
+
+# ------------------------------------------------------------------ styling
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    CYAN = "\033[36m"
+
+
+def _color_ok():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def paint(text, *codes):
+    if not _color_ok():
+        return text
+    return "".join(codes) + text + C.RESET
+
+
+def heading(text):
+    print(paint(f"\n{text}", C.BOLD, C.CYAN))
+
+
+def ok(text):
+    print(paint("  ✓ ", C.GREEN) + text)
+
+
+def warn(text):
+    print(paint("  ! ", C.YELLOW) + text)
+
+
+def err(text):
+    print(paint("  ✗ ", C.RED) + text, file=sys.stderr)
+
+
+def dim(text):
+    return paint(text, C.DIM)
+
+
+# --------------------------------------------------------------- registry
+def load_registry():
+    if not REGISTRY_PATH.exists():
+        return {}
+    return json.loads(REGISTRY_PATH.read_text())
+
+
+def save_registry(data):
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REGISTRY_PATH.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def slugify(text):
+    return re.sub(r"[^a-z0-9-]+", "-", text.lower()).strip("-")
+
+
+# ------------------------------------------------------------- interactive
+def ask(prompt, default=None, required=False):
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        raw = input(paint(f"  {prompt}{suffix}: ", C.BOLD)).strip()
+        if not raw and default is not None:
+            return default
+        if not raw and required:
+            print(dim("    required, try again"))
+            continue
+        return raw
+
+
+def ask_int(prompt, default=None):
+    while True:
+        raw = ask(prompt, default=str(default) if default is not None else None)
+        try:
+            return int(raw)
+        except ValueError:
+            print(dim("    not a number, try again"))
+
+
+def ask_optional_int(prompt):
+    raw = ask(prompt, default="")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(dim("    not a number, skipping"))
+        return None
+
+
+def ask_yes_no(prompt, default=True):
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        raw = input(paint(f"  {prompt} [{suffix}]: ", C.BOLD)).strip().lower()
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+
+
+def ask_path(prompt, default=None):
+    while True:
+        raw = ask(prompt, default=default, required=True)
+        path = Path(raw).expanduser().resolve()
+        if path.is_dir():
+            return str(path)
+        print(dim(f"    '{path}' isn't a directory, try again"))
+
+
+def ask_choice(prompt, options):
+    print(paint(f"  {prompt}", C.BOLD))
+    for i, opt in enumerate(options, 1):
+        print(f"    {i}) {opt}")
+    while True:
+        raw = input(paint("  > ", C.BOLD)).strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1]
+        print(dim(f"    enter a number 1-{len(options)}"))
+
+
+# ------------------------------------------------------------- run helpers
+def wait_for_port(port, timeout=120, host="localhost"):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            time.sleep(1)
+    return False
+
+
+def is_port_open(port, host="localhost"):
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def compose_has_containers(compose_project):
+    r = subprocess.run(
+        ["docker", "compose", "-p", compose_project, "ps", "-q"],
+        capture_output=True, text=True,
+    )
+    return bool(r.stdout.strip())
+
+
+def service_running(svc):
+    port = svc.get("port")
+    if port:
+        return is_port_open(port)
+    if svc["runner"] == "docker-compose":
+        return compose_has_containers(svc["compose_project"])
+    return None  # unknown - no port and not docker-compose
+
+
+def build_pane_command(svc):
+    path = svc["path"]
+    runner = svc["runner"]
+    if runner == "docker-compose":
+        build = "--build" if svc.get("build", True) else ""
+        project = svc["compose_project"]
+        return (
+            f'cd "{path}" && docker compose -p "{project}" up -d {build} '
+            f'&& docker compose -p "{project}" logs -f --tail 100; exec bash'
+        )
+    if runner in ("yarn", "pnpm"):
+        script = svc.get("script", "dev")
+        return f'cd "{path}" && {runner} {script}; exec bash'
+    if runner == "npm":
+        script = svc.get("script", "dev")
+        return f'cd "{path}" && npm run {script}; exec bash'
+    if runner == "poetry":
+        return f'cd "{path}" && poetry run {svc["command"]}; exec bash'
+    if runner == "custom":
+        return f'cd "{path}" && {svc["command"]}; exec bash'
+    raise ValueError(f"unknown runner {runner!r}")
+
+
+def ensure_network(name):
+    r = subprocess.run(["docker", "network", "inspect", name], capture_output=True)
+    if r.returncode != 0:
+        ok(f"creating shared docker network '{name}'")
+        subprocess.run(["docker", "network", "create", name], check=True)
+
+
+def tmux_session_name(project):
+    return f"devstack-{project}"
+
+
+def tmux_has_session(session):
+    return subprocess.run(
+        ["tmux", "has-session", "-t", session], capture_output=True
+    ).returncode == 0
+
+
+# ------------------------------------------------------------------- infra
+def infra_up():
+    subprocess.run(
+        ["docker", "compose", "-p", INFRA_PROJECT, "-f", str(INFRA_COMPOSE), "up", "-d"],
+        check=True, capture_output=True,
+    )
+
+
+def cmd_infra_up(args):
+    infra_up()
+    ok(f"devstack infra is up. Logs: {DOZZLE_URL}")
+
+
+def cmd_infra_down(args):
+    subprocess.run(
+        ["docker", "compose", "-p", INFRA_PROJECT, "-f", str(INFRA_COMPOSE), "down"],
+        check=True,
+    )
+
+
+# ---------------------------------------------------------------- register
+def configure_runner(runner):
+    if runner == "docker-compose":
+        return {
+            "compose_project": ask("compose project name (-p)", required=True),
+            "build": ask_yes_no("build image before starting?", default=True),
+        }
+    if runner in ("yarn", "pnpm", "npm"):
+        return {"script": ask("script to run", default="dev")}
+    if runner == "poetry":
+        return {"command": ask("command to run after 'poetry run'", required=True)}
+    if runner == "custom":
+        return {"command": ask("full shell command to run", required=True)}
+    raise ValueError(runner)
+
+
+def register_one_service(project_slug, existing_names):
+    heading("New service")
+    while True:
+        name = ask("name (e.g. back, front, keycloak)", required=True)
+        if name not in existing_names:
+            break
+        print(dim(f"    '{name}' is already used in this project, pick another"))
+    path = ask_path("path (directory)")
+    runner = ask_choice("how is it run?", RUNNERS)
+    extra = configure_runner(runner)
+    default_port = None
+    port = ask_optional_int("port to wait on before starting the next service (blank = none)")
+    svc = {"name": name, "path": path, "runner": runner, "port": port}
+    svc.update(extra)
+    if runner == "docker-compose" and not svc.get("compose_project"):
+        svc["compose_project"] = f"{project_slug}-{name}"
+    return svc
+
+
+def print_service_summary(services):
+    for i, svc in enumerate(services, 1):
+        extra = svc.get("compose_project") or svc.get("script") or svc.get("command", "")
+        port = f":{svc['port']}" if svc.get("port") else ""
+        runner = svc["runner"]
+        print(f"    {i}. {paint(svc['name'], C.BOLD)}{port} "
+              f"{dim(f'({runner} - {extra})')}")
+
+
+def cmd_register(args):
+    registry = load_registry()
+    existing = registry.get(args.name)
+    services = []
+    network = None
+
+    if existing:
+        heading(f"'{args.name}' is already registered")
+        print_service_summary(existing.get("services", []))
+        choice = ask_choice(
+            "what do you want to do?",
+            ["Add more services to it", "Start over (replace everything)", "Cancel"],
+        )
+        if choice == "Cancel":
+            return
+        if choice == "Add more services to it":
+            services = existing.get("services", [])
+            network = existing.get("network")
+
+    if network is None:
+        network = ask(
+            "shared docker network these services need (blank if none)", default=""
+        ) or None
+
+    existing_names = {s["name"] for s in services}
+    while True:
+        if not ask_yes_no("Add a service?", default=(len(services) == 0)):
+            break
+        svc = register_one_service(slugify(args.name), existing_names)
+        services.append(svc)
+        existing_names.add(svc["name"])
+        heading("Services so far")
+        print_service_summary(services)
+
+    if not services:
+        warn("no services added, nothing saved")
+        return
+
+    heading(f"Final config for '{args.name}'")
+    print_service_summary(services)
+    if not ask_yes_no("Save this configuration?", default=True):
+        warn("not saved")
+        return
+
+    registry[args.name] = {"network": network, "services": services}
+    save_registry(registry)
+    ok(f"saved '{args.name}' ({len(services)} service(s)) -> {REGISTRY_PATH}")
+
+
+def cmd_edit(args):
+    registry = load_registry()
+    entry = registry.get(args.name)
+    if entry is None:
+        err(f"'{args.name}' isn't registered. Run 'devstack list' to see what is.")
+        sys.exit(1)
+    editor = shlex.split(os.environ.get("EDITOR", "nano"))
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+        json.dump(entry, tf, indent=2)
+        tf.write("\n")
+        tmp_path = tf.name
+    try:
+        subprocess.run([*editor, tmp_path], check=True)
+        try:
+            new_entry = json.loads(Path(tmp_path).read_text())
+        except json.JSONDecodeError as e:
+            err(f"invalid JSON, not saved: {e}")
+            sys.exit(1)
+        registry[args.name] = new_entry
+        save_registry(registry)
+        ok(f"saved changes to '{args.name}'")
+    finally:
+        os.unlink(tmp_path)
+
+
+def cmd_list(args):
+    registry = load_registry()
+    if not registry:
+        print("No projects registered yet. Run 'devstack register <name>'.")
+        return
+    for name, entry in sorted(registry.items()):
+        heading(name)
+        for svc in entry["services"]:
+            running = service_running(svc)
+            dot = paint("●", C.GREEN) if running else (
+                dim("○") if running is False else dim("○?")
+            )
+            extra = svc.get("compose_project") or svc.get("script") or svc.get("command", "")
+            runner = svc["runner"]
+            name_col = paint(f"{svc['name']:<20}", C.BOLD)
+            port_text = f"localhost:{svc['port']}" if svc.get("port") else "no port"
+            port_col = f"{port_text:<22}"
+            if not svc.get("port"):
+                port_col = dim(port_col)
+            print(f"    {dot} {name_col} {port_col} {dim(f'{runner} - {extra}')}")
+    print(dim(f"\n  logs: {DOZZLE_URL}"))
+
+
+def cmd_names(args):
+    # plain, uncolored, one per line - for shell completion scripts to consume
+    registry = load_registry()
+    for name in sorted(registry):
+        print(name)
+
+
+# --------------------------------------------------------------------- run
+def running_projects(registry, exclude=None):
+    running = []
+    for name, entry in registry.items():
+        if name == exclude:
+            continue
+        if any(service_running(svc) for svc in entry["services"]):
+            running.append(name)
+    return running
+
+
+def teardown_project(name, entry):
+    for svc in reversed(entry["services"]):
+        if svc["runner"] == "docker-compose":
+            heading(f"Stopping {svc['name']}")
+            subprocess.run(["docker", "compose", "-p", svc["compose_project"], "down"])
+
+    session = tmux_session_name(name)
+    if shutil.which("tmux") and tmux_has_session(session):
+        subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+        ok(f"killed tmux session '{session}'")
+
+
+def check_other_running(registry, name):
+    others = running_projects(registry, exclude=name)
+    if not others:
+        return
+
+    heading("Another project looks like it's already running")
+    for o in others:
+        warn(o)
+
+    if not sys.stdin.isatty():
+        warn("non-interactive - leaving it running and continuing")
+        return
+
+    label = others[0] if len(others) == 1 else "them"
+    choice = ask_choice(
+        "what do you want to do?",
+        [f"Stop {label} and continue", "Keep it running and start this too", "Cancel"],
+    )
+    if choice == "Cancel":
+        print("cancelled")
+        sys.exit(0)
+    if choice.startswith("Stop"):
+        for o in others:
+            teardown_project(o, registry[o])
+
+
+def run_fallback(name, entry):
+    warn("tmux not found - running services sequentially, no split panes.")
+    services = entry["services"]
+    for i, svc in enumerate(services):
+        is_last = i == len(services) - 1
+        cmd = build_pane_command(svc)
+        heading(f"Starting {svc['name']}")
+        if is_last and svc["runner"] != "docker-compose":
+            print(dim(f"    {cmd}"))
+            os.execvp("bash", ["bash", "-c", cmd])
+            return  # unreachable
+        log_path = Path(tempfile.gettempdir()) / f"devstack-{name}-{svc['name']}.log"
+        logf = open(log_path, "w")
+        subprocess.Popen(["bash", "-c", cmd], stdout=logf, stderr=subprocess.STDOUT)
+        print(dim(f"    logging to {log_path}"))
+        if svc.get("port"):
+            if wait_for_port(svc["port"]):
+                ok(f"{svc['name']} is up on :{svc['port']}")
+            else:
+                err(f"timed out waiting for {svc['name']} on :{svc['port']}")
+    print(f"\nAll services started in background. Logs: {DOZZLE_URL}")
+
+
+def cmd_run(args):
+    registry = load_registry()
+    entry = registry.get(args.name)
+    if entry is None:
+        err(f"'{args.name}' isn't registered. Run 'devstack register {args.name}' first.")
+        sys.exit(1)
+
+    check_other_running(registry, args.name)
+
+    infra_up()
+    if entry.get("network"):
+        ensure_network(entry["network"])
+
+    services = entry["services"]
+
+    if shutil.which("tmux") is None:
+        run_fallback(args.name, entry)
+        return
+
+    session = tmux_session_name(args.name)
+    if tmux_has_session(session):
+        ok(f"session '{session}' already running")
+    else:
+        for i, svc in enumerate(services):
+            cmd = build_pane_command(svc)
+            heading(f"Starting {svc['name']}")
+            if i == 0:
+                subprocess.run(
+                    ["tmux", "new-session", "-d", "-s", session, "-n", "main", cmd],
+                    check=True,
+                )
+            else:
+                subprocess.run(["tmux", "split-window", "-t", session, cmd], check=True)
+            if svc.get("port"):
+                if wait_for_port(svc["port"]):
+                    ok(f"{svc['name']} is up on :{svc['port']}")
+                else:
+                    err(f"timed out waiting for {svc['name']} on :{svc['port']}")
+        subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
+
+    heading(args.name)
+    for svc in services:
+        port = f"http://localhost:{svc['port']}" if svc.get("port") else "(no port)"
+        name_col = paint(f"{svc['name']:<14}", C.BOLD)
+        print(f"  {name_col} {port}")
+    logs_col = paint(f"{'logs (all)':<14}", C.BOLD)
+    print(f"  {logs_col} {DOZZLE_URL}")
+    print(f"\ntmux session: {session}")
+
+    if sys.stdout.isatty():
+        os.execvp("tmux", ["tmux", "attach", "-t", session])
+    else:
+        print(f"Attach with: tmux attach -t {session}")
+
+
+def cmd_down(args):
+    registry = load_registry()
+    entry = registry.get(args.name)
+    if entry is None:
+        err(f"'{args.name}' isn't registered. Run 'devstack list' to see what is.")
+        sys.exit(1)
+
+    teardown_project(args.name, entry)
+
+
+COMMANDS_HELP = [
+    ("register <name>", "interactively define a project's services"),
+    ("edit <name>", "open a project's config in $EDITOR"),
+    ("list", "show registered projects and live status"),
+    ("run <name>", "boot a registered project's stack"),
+    ("down <name>", "tear down a registered project's stack"),
+    ("infra up|down", "manage the shared Dozzle log viewer"),
+]
+
+
+def print_help():
+    print(paint("devstack", C.BOLD, C.CYAN) +
+          " — global launcher for multi-repo dev stacks")
+    heading("USAGE")
+    print("  devstack <command> [args]")
+    heading("COMMANDS")
+    width = max(len(cmd) for cmd, _ in COMMANDS_HELP)
+    for cmd, desc in COMMANDS_HELP:
+        cmd_col = paint(f"{cmd:<{width}}", C.BOLD)
+        print(f"  {cmd_col}  {dim(desc)}")
+    heading("EXAMPLES")
+    for line in ("devstack register lawial", "devstack run lawial", "devstack list"):
+        print(dim(f"  {line}"))
+    print(f"\n{dim('logs:')} {DOZZLE_URL}")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="devstack", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("register", help="interactively define a project's services")
+    p.add_argument("name", help="project name")
+    p.set_defaults(func=cmd_register)
+
+    p = sub.add_parser("edit", help="open a project's config in $EDITOR")
+    p.add_argument("name", help="project name")
+    p.set_defaults(func=cmd_edit)
+
+    p = sub.add_parser("list", help="show registered projects and live status")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("run", help="boot a registered project's stack")
+    p.add_argument("name", help="project name")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("down", help="tear down a registered project's stack")
+    p.add_argument("name", help="project name")
+    p.set_defaults(func=cmd_down)
+
+    infra = sub.add_parser("infra", help="manage the shared Dozzle log viewer")
+    infra_sub = infra.add_subparsers(dest="infra_command", required=True)
+    p = infra_sub.add_parser("up", help="start Dozzle")
+    p.set_defaults(func=cmd_infra_up)
+    p = infra_sub.add_parser("down", help="stop Dozzle")
+    p.set_defaults(func=cmd_infra_down)
+
+    p = sub.add_parser("_names", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_names)
+
+    return parser
+
+
+def main():
+    if len(sys.argv) == 1 or sys.argv[1] in ("-h", "--help"):
+        print_help()
+        return
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,38 @@
+#compdef devstack
+# zsh completion for devstack - autoloaded via fpath by install.sh
+
+_devstack() {
+    local -a commands
+    commands=(
+        'register:interactively define a project'"'"'s services'
+        'edit:open a project'"'"'s config in $EDITOR'
+        'list:show registered projects and live status'
+        'run:boot a registered project'"'"'s stack'
+        'down:tear down a registered project'"'"'s stack'
+        'infra:manage the shared Dozzle log viewer'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+        return
+    fi
+
+    case ${words[2]} in
+        register|edit|run|down)
+            if (( CURRENT == 3 )); then
+                local -a names
+                names=(${(f)"$(devstack _names 2>/dev/null)"})
+                _describe 'project' names
+            fi
+            ;;
+        infra)
+            if (( CURRENT == 3 )); then
+                local -a infra_commands
+                infra_commands=(up down)
+                _describe 'infra command' infra_commands
+            fi
+            ;;
+    esac
+}
+
+_devstack
